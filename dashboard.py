@@ -15,9 +15,65 @@ from socketserver import ThreadingMixIn
 from urllib.request import urlopen, Request
 from urllib.error import URLError
 
+# RealSense SDK — opens RGB+IR from ONE device handle, killing the two-ffmpeg
+# USB negotiation race. If unavailable, we fall back to the staggered ffmpeg path.
+try:
+    import pyrealsense2 as rs
+    import numpy as np
+    REALSENSE_SDK = True
+except Exception as _e:
+    REALSENSE_SDK = False
+    print(f"[realsense] SDK unavailable ({_e}); using ffmpeg fallback")
+
+# JPEG encoder — pick the lightest backend available. Avoids the heavy
+# python3-opencv apt chain; simplejpeg/Pillow both have aarch64 wheels.
+_JPEG_BACKEND = None
+if REALSENSE_SDK:
+    try:
+        import simplejpeg
+        _JPEG_BACKEND = "simplejpeg"
+    except Exception:
+        try:
+            from PIL import Image
+            _JPEG_BACKEND = "pillow"
+        except Exception:
+            try:
+                import cv2
+                _JPEG_BACKEND = "cv2"
+            except Exception:
+                _JPEG_BACKEND = None
+                REALSENSE_SDK = False
+                print("[realsense] no JPEG backend (simplejpeg/Pillow/cv2); "
+                      "using ffmpeg fallback")
+    if _JPEG_BACKEND:
+        print(f"[realsense] JPEG backend: {_JPEG_BACKEND}")
+
+
+def encode_jpeg(arr, gray, quality=80):
+    """Encode an RGB (HxWx3) or grayscale (HxW) numpy array to JPEG bytes."""
+    if _JPEG_BACKEND == "simplejpeg":
+        if gray:
+            return simplejpeg.encode_jpeg(arr.reshape(arr.shape[0], arr.shape[1], 1),
+                                          quality=quality, colorspace="GRAY")
+        return simplejpeg.encode_jpeg(arr, quality=quality, colorspace="RGB")
+    if _JPEG_BACKEND == "pillow":
+        import io
+        buf = io.BytesIO()
+        Image.fromarray(arr, mode="L" if gray else "RGB").save(
+            buf, format="JPEG", quality=quality)
+        return buf.getvalue()
+    if _JPEG_BACKEND == "cv2":
+        # cv2 assumes BGR input; our color frames are RGB, so swap channels
+        src = arr if gray else arr[:, :, ::-1]
+        ok, jpg = cv2.imencode(".jpg", src, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        return jpg.tobytes() if ok else None
+    return None
+
 # ── config ────────────────────────────────────────────────────────────────────
 PORT        = 8080
-FPS         = 10          # lower FPS reduces USB bandwidth contention on RealSense
+FPS         = 10          # ffmpeg/UVC: lower FPS reduces USB bandwidth contention
+REALSENSE_FPS = 15        # SDK serves both streams from one handle — no bandwidth race,
+                          # so use a valid D4xx framerate (6/15/30/60; 10 is NOT valid)
 MOTOR_PI_IP = "YOUR_MOTOR_PI_IP"
 MOTOR_PORT  = 8081
 
@@ -96,6 +152,28 @@ def list_cameras():
                 cameras.append({"index": i, "device": dev,
                                 "name": f"USB Camera {i}", "kind": "uvc", "auto": ""})
     return cameras
+
+
+# Camera hardware is static, but `v4l2-ctl --list-devices` returns nothing for a
+# RealSense node once the SDK pipeline has claimed it over libusb. So a second
+# browser loading the page mid-stream would see "no cameras". Cache the first
+# good enumeration and reuse it for every page load.
+_cameras_cache = []
+_cameras_lock  = threading.Lock()
+
+
+def get_cameras(force=False):
+    global _cameras_cache
+    with _cameras_lock:
+        if _cameras_cache and not force:
+            return _cameras_cache
+    found = list_cameras()
+    with _cameras_lock:
+        # Only overwrite with a non-empty result, so a probe that races a busy
+        # device (returns fewer/no cameras) can't clobber a known-good list.
+        if found and (force or len(found) >= len(_cameras_cache)):
+            _cameras_cache = found
+        return _cameras_cache
 
 
 # ── per-camera broadcaster ────────────────────────────────────────────────────
@@ -205,15 +283,201 @@ def get_stream(device, kind="uvc"):
         return _streams[device]
 
 
+# ── RealSense hub — one pipeline, both streams, one device handle ───────────────
+
+class RealSenseHub:
+    """Drives RGB + IR from a single rs.pipeline.
+
+    Both streams share one USB device context, so there is no concurrent-open
+    race — the bandwidth conflict that the ffmpeg stagger worked around cannot
+    occur here. Frames are JPEG-encoded and fanned out to per-kind client
+    queues, mirroring the CameraStream broadcaster contract.
+    """
+
+    def __init__(self):
+        self.lock     = threading.Lock()
+        self.clients  = {"intel": [], "ir": []}   # kind -> [queue, ...]
+        self.running  = False
+        self.thread   = None
+        self.pipeline = None
+
+    def stop(self):
+        """Release the device cleanly. Safe to call from a signal handler or
+        atexit. Without this, an abrupt process exit leaks the USB handle and
+        the next start fails with 'Couldn't resolve requests' / device busy."""
+        with self.lock:
+            self.running = False
+            t = self.thread
+        if t and t.is_alive():
+            t.join(timeout=6)          # _run's finally stops the pipeline
+        # Backstop: if the thread didn't stop it (e.g. crashed), stop directly.
+        p = self.pipeline
+        if p is not None:
+            try:
+                p.stop()
+            except Exception:
+                pass
+            self.pipeline = None
+
+    def is_running(self):
+        with self.lock:
+            return self.running
+
+    def restart(self, delay=2.0):
+        """Stop the pipeline, wait `delay`s, then restart it if viewers remain.
+        Runs in a background thread so the HTTP request returns immediately."""
+        def worker():
+            self.stop()                       # releases the device
+            if delay > 0:
+                time.sleep(delay)
+            with self.lock:
+                has_clients = self.clients["intel"] or self.clients["ir"]
+                if has_clients and not self.running:
+                    self._start()
+                    print(f"[realsense] restarted after {delay}s")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def add_client(self, kind):
+        q = queue.Queue(maxsize=5)
+        with self.lock:
+            self.clients[kind].append(q)
+            if not self.running:
+                self._start()
+        return q
+
+    def remove_client(self, kind, q):
+        with self.lock:
+            if q in self.clients[kind]:
+                self.clients[kind].remove(q)
+
+    def _start(self):
+        self.running = True
+        self.thread  = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        w, h     = RES["intel"]
+        pipeline = rs.pipeline()
+        config   = rs.config()
+        config.enable_stream(rs.stream.color, w, h, rs.format.rgb8, REALSENSE_FPS)
+        config.enable_stream(rs.stream.infrared, 1, w, h, rs.format.y8, REALSENSE_FPS)  # index 1 = left IR
+        try:
+            pipeline.start(config)
+        except Exception as e:
+            print(f"[realsense] pipeline start failed: {e}")
+            with self.lock:
+                self.running = False
+            return
+
+        self.pipeline = pipeline
+        print("[realsense] pipeline started — RGB+IR from one device handle")
+        try:
+            while self.running:
+                with self.lock:
+                    if not self.clients["intel"] and not self.clients["ir"]:
+                        break
+                try:
+                    frames = pipeline.wait_for_frames(5000)
+                except Exception as e:
+                    print(f"[realsense] wait_for_frames: {e}")
+                    break
+                self._fan("intel", frames.get_color_frame())
+                self._fan("ir",    frames.get_infrared_frame(1))
+        finally:
+            try:
+                pipeline.stop()
+            except Exception:
+                pass
+            self.pipeline = None
+            with self.lock:
+                self.running = False
+            print("[realsense] pipeline stopped")
+
+    def _fan(self, kind, frame):
+        if not frame:
+            return
+        with self.lock:
+            qs = list(self.clients[kind])
+        if not qs:
+            return
+        img  = np.asanyarray(frame.get_data())
+        data = encode_jpeg(img, gray=(kind == "ir"))
+        if not data:
+            return
+        for q in qs:
+            try:
+                q.put_nowait(data)
+            except queue.Full:
+                pass
+
+
+realsense_hub = RealSenseHub() if REALSENSE_SDK else None
+
+
+def is_realsense_node(device):
+    return REALSENSE_SDK and device in (REALSENSE_RGB_NODE, REALSENSE_IR_NODE)
+
+
 # ── motor relay ───────────────────────────────────────────────────────────────
 
-MOTOR_BASE = f"http://{MOTOR_PI_IP}:{MOTOR_PORT}/motor"
+# Motor Pi IP is runtime-configurable from the dashboard and persisted here so
+# it survives restarts. MOTOR_PI_IP above is only the first-boot default.
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "dashboard_config.json")
+
+_motor_ip   = MOTOR_PI_IP
+_config_lock = threading.Lock()
+
+# Accept dotted IPv4 or a hostname/Tailscale name; reject anything with chars
+# that could smuggle a port, path, or scheme into the URL.
+_IP_RE = re.compile(r"^[A-Za-z0-9.\-]{1,253}$")
+
+
+def _load_config():
+    global _motor_ip
+    try:
+        with open(CONFIG_FILE) as f:
+            data = json.load(f)
+        ip = data.get("motor_pi_ip")
+        if ip and _IP_RE.match(ip):
+            _motor_ip = ip
+            print(f"[config] loaded motor Pi IP: {_motor_ip}")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[config] load failed ({e}); using default {_motor_ip}")
+
+
+def get_motor_ip():
+    with _config_lock:
+        return _motor_ip
+
+
+def set_motor_ip(ip):
+    """Validate, store, and persist a new motor Pi IP. Returns (ok, msg)."""
+    ip = (ip or "").strip()
+    if not _IP_RE.match(ip):
+        return False, "invalid IP or hostname"
+    global _motor_ip
+    with _config_lock:
+        _motor_ip = ip
+        try:
+            with open(CONFIG_FILE, "w") as f:
+                json.dump({"motor_pi_ip": ip}, f)
+        except Exception as e:
+            return False, f"saved in memory but write failed: {e}"
+    print(f"[config] motor Pi IP set to {ip}")
+    return True, ip
+
+
+def motor_base():
+    return f"http://{get_motor_ip()}:{MOTOR_PORT}/motor"
 
 
 def motor_post(cmd):
     try:
         body = json.dumps({"cmd": cmd}).encode()
-        req  = Request(MOTOR_BASE, data=body,
+        req  = Request(motor_base(), data=body,
                        headers={"Content-Type": "application/json"}, method="POST")
         with urlopen(req, timeout=3) as r:
             data = json.loads(r.read())
@@ -226,7 +490,7 @@ def motor_post(cmd):
 
 def motor_get():
     try:
-        with urlopen(MOTOR_BASE, timeout=3) as r:
+        with urlopen(motor_base(), timeout=3) as r:
             data = json.loads(r.read())
             return True, data.get("state", "unknown")
     except Exception as e:
@@ -305,6 +569,26 @@ header{width:100%;max-width:1100px;display:flex;align-items:center;gap:14px;flex
   border-radius:6px;cursor:pointer}
 .re-btn.L{background:var(--green-dim);color:var(--green);border:1px solid rgba(0,201,125,.35)}
 .re-btn.R{background:var(--purple-dim);color:var(--purple);border:1px solid rgba(181,122,255,.4)}
+.pipe-ctrl{display:flex;align-items:center;gap:12px;flex-wrap:wrap;width:100%;
+  max-width:1100px;background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--r);padding:10px 16px}
+.pipe-title{font-family:monospace;font-size:.65rem;font-weight:700;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--muted)}
+.pipe-badge{font-family:monospace;font-size:.6rem;font-weight:700;letter-spacing:.1em;
+  padding:2px 8px;border-radius:20px;text-transform:uppercase}
+.pipe-badge.on {background:var(--green-dim);color:var(--green);border:1px solid rgba(0,201,125,.3)}
+.pipe-badge.off{background:var(--red-dim);color:var(--red);border:1px solid rgba(255,76,76,.3)}
+.pc-btn{font-family:monospace;font-size:.68rem;font-weight:700;padding:6px 14px;
+  border-radius:6px;cursor:pointer;border:1px solid}
+.pc-stop{background:var(--red-dim);color:var(--red);border-color:rgba(255,76,76,.35)}
+.pc-stop:hover{background:rgba(255,76,76,.25)}
+.pc-restart{background:var(--blue-dim);color:var(--blue);border-color:rgba(58,143,255,.35)}
+.pc-restart:hover{background:rgba(58,143,255,.25)}
+.pc-delay{font-family:monospace;font-size:.66rem;color:var(--muted);display:flex;
+  align-items:center;gap:5px}
+.pc-delay input{width:56px;font-family:monospace;font-size:.72rem;color:var(--text);
+  background:var(--bg);border:1px solid var(--border);border-radius:5px;padding:4px 6px}
+.pipe-status{font-family:monospace;font-size:.7rem;margin-left:auto}
 .cam-list{display:flex;flex-wrap:wrap;gap:10px;width:100%;max-width:1100px}
 .cam-row{display:flex;align-items:center;gap:10px;padding:10px 14px;
   background:var(--surface);border:1px solid var(--border);border-radius:var(--r);flex:1 1 240px}
@@ -359,6 +643,18 @@ header{width:100%;max-width:1100px;display:flex;align-items:center;gap:14px;flex
 .motor-conn-warn{font-family:monospace;font-size:.7rem;color:var(--amber);
   background:var(--amber-dim);border:1px solid rgba(255,179,64,.3);
   border-radius:6px;padding:8px 12px;display:none}
+.ip-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.ip-label{font-family:monospace;font-size:.65rem;font-weight:700;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--muted)}
+.ip-input{font-family:monospace;font-size:.78rem;color:var(--text);
+  background:var(--bg);border:1px solid var(--border);border-radius:6px;
+  padding:7px 10px;min-width:180px;flex:0 1 220px}
+.ip-input:focus{outline:none;border-color:var(--green2)}
+.ip-save{font-family:monospace;font-size:.68rem;font-weight:700;padding:7px 16px;
+  border-radius:6px;cursor:pointer;background:var(--green-dim);color:var(--green);
+  border:1px solid rgba(0,201,125,.35)}
+.ip-save:hover{background:rgba(0,201,125,.25)}
+.ip-status{font-family:monospace;font-size:.7rem}
 .kbd-hint{display:flex;gap:14px;flex-wrap:wrap}
 .kh{display:flex;align-items:center;gap:6px;font-family:monospace;font-size:.65rem;color:var(--muted)}
 kbd{background:var(--border);border:1px solid #2e3440;border-radius:4px;
@@ -476,19 +772,23 @@ function disconnect(slot, device) {
   slots[slot] = null;
 }
 
-// auto-assign RGB first, then IR after a short delay so the browser
-// requests RGB before IR — matches the server-side stagger
-var rgbCam = CAMS.find(function(c){ return c.auto === 'L'; });
-var irCam  = CAMS.find(function(c){ return c.auto === 'R'; });
-if (rgbCam) assign('L', rgbCam);
-setTimeout(function(){
-  if (irCam) assign('R', irCam);
-}, 2500);
-// assign any unassigned UVC to first free slot
-CAMS.forEach(function(cam){
-  if (cam.kind === 'uvc' && !slots.L) assign('L', cam);
-  else if (cam.kind === 'uvc' && !slots.R) assign('R', cam);
-});
+// Deterministic layout by kind: RGB -> Left, IR -> Right. (The 'auto' field
+// and node order are not trusted here.) UVC cams fill any leftover slot, but
+// only AFTER IR is placed so they can't steal the right panel.
+var rgbCam = CAMS.find(function(c){ return c.kind === 'intel'; });
+var irCam  = CAMS.find(function(c){ return c.kind === 'ir'; });
+function fillUVC(){
+  CAMS.forEach(function(cam){
+    if (cam.kind !== 'uvc') return;
+    if (!slots.L) assign('L', cam);
+    else if (!slots.R) assign('R', cam);
+  });
+}
+if (rgbCam) assign('L', rgbCam);          // RGB always left
+function placeIR(){ if (irCam) assign('R', irCam); fillUVC(); }
+// SDK: instant (IR_DELAY_MS=0). ffmpeg fallback: stagger so RGB opens first.
+if (IR_DELAY_MS > 0) setTimeout(placeIR, IR_DELAY_MS); else placeIR();
+fillUVC();   // place UVC immediately when no RealSense is present
 
 // motor
 function setStateBadge(state) {
@@ -525,6 +825,71 @@ function pollMotor() {
 }
 setInterval(pollMotor, 4000);
 pollMotor();
+
+// motor Pi IP config
+function loadConfig() {
+  fetch('/config')
+  .then(function(r){ return r.json(); })
+  .then(function(d){ document.getElementById('ip-input').value = d.motor_pi_ip || ''; })
+  .catch(function(){});
+}
+function saveMotorIp() {
+  var ip  = document.getElementById('ip-input').value.trim();
+  var st  = document.getElementById('ip-status');
+  fetch('/config', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({motor_pi_ip: ip})})
+  .then(function(r){ return r.json(); })
+  .then(function(d){
+    if (d.ok) { st.textContent = 'Saved \\u2713'; st.style.color = 'var(--green)'; pollMotor(); }
+    else      { st.textContent = d.error || 'error'; st.style.color = 'var(--red)'; }
+    setTimeout(function(){ st.textContent = ''; }, 3000);
+  })
+  .catch(function(){ st.textContent = 'Network error'; st.style.color = 'var(--red)'; });
+}
+loadConfig();
+
+// RealSense pipeline control (only present when SDK active)
+function setPipeBadge(running) {
+  var b = document.getElementById('pipe-badge');
+  if (!b) return;
+  b.className = 'pipe-badge ' + (running ? 'on' : 'off');
+  b.textContent = running ? 'running' : 'stopped';
+}
+function pollPipeline() {
+  if (!document.getElementById('pipe-badge')) return;
+  fetch('/pipeline').then(function(r){ return r.json(); })
+  .then(function(d){ setPipeBadge(d.running); }).catch(function(){});
+}
+function pipeStatus(msg, ok) {
+  var s = document.getElementById('pipe-status');
+  if (!s) return;
+  s.textContent = msg; s.style.color = ok ? 'var(--green)' : 'var(--red)';
+  setTimeout(function(){ s.textContent = ''; }, 4000);
+}
+function stopPipeline() {
+  fetch('/pipeline', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({action:'stop'})})
+  .then(function(r){ return r.json(); })
+  .then(function(d){ if (d.ok){ setPipeBadge(false); pipeStatus('Stopped \\u2713', true); }
+                     else pipeStatus(d.error||'error', false); })
+  .catch(function(){ pipeStatus('Network error', false); });
+}
+function restartPipeline() {
+  var delay = parseFloat(document.getElementById('pipe-delay').value) || 0;
+  pipeStatus('Restarting in ' + delay + 's\\u2026', true);
+  fetch('/pipeline', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({action:'restart', delay: delay})})
+  .then(function(r){ return r.json(); })
+  .then(function(d){
+    if (!d.ok) { pipeStatus(d.error||'error', false); return; }
+    // poll back to running after the delay completes
+    setTimeout(pollPipeline, (delay + 1.5) * 1000);
+  })
+  .catch(function(){ pipeStatus('Network error', false); });
+}
+pollPipeline();
+setInterval(pollPipeline, 5000);
+
 document.addEventListener('keydown', function(e){
   if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
   if (e.key==='u'||e.key==='U') motorCmd('up');
@@ -538,7 +903,24 @@ def build_dashboard(cameras):
     cjson   = cam_json(cameras)
     n       = len(cameras)
     no_cams = "" if cameras else '<p class="no-cams">No cameras detected.</p>'
-    js      = HTML_JS.replace("CAMS_JSON", cjson)
+    # SDK serves both streams from one handle, so the IR open can be instant;
+    # the ffmpeg fallback still needs the stagger to dodge the USB race.
+    ir_delay = "0" if REALSENSE_SDK else "2500"
+    js       = HTML_JS.replace("CAMS_JSON", cjson).replace("IR_DELAY_MS", ir_delay)
+
+    # RealSense pipeline controls only make sense when the SDK drives the device.
+    pipe_ctrl = (
+        '<div class="pipe-ctrl">\n'
+        '  <span class="pipe-title">RealSense pipeline</span>\n'
+        '  <span class="pipe-badge" id="pipe-badge">&hellip;</span>\n'
+        '  <button class="pc-btn pc-stop" onclick="stopPipeline()">&#9632; Stop</button>\n'
+        '  <span class="pc-delay">restart delay\n'
+        '    <input id="pipe-delay" type="number" min="0" max="30" step="0.5" value="2"/>s\n'
+        '  </span>\n'
+        '  <button class="pc-btn pc-restart" onclick="restartPipeline()">&#8635; Restart</button>\n'
+        '  <span class="pipe-status" id="pipe-status"></span>\n'
+        '</div>\n'
+    ) if REALSENSE_SDK else ''
 
     return (
         '<!DOCTYPE html>\n<html lang="en">\n<head>\n'
@@ -558,6 +940,7 @@ def build_dashboard(cameras):
         '  <div class="panel" id="pL"><div class="ph"><span>RGB</span>Loading&hellip;</div></div>\n'
         '  <div class="panel" id="pR"><div class="ph"><span>IR</span>Loading&hellip;</div></div>\n'
         '</div>\n'
+        + pipe_ctrl +
         '<div class="cam-list" id="cam-list">' + no_cams + '</div>\n'
         '<div class="section-label">&#9881; Door motor</div>\n'
         '<div class="motor-panel">\n'
@@ -566,8 +949,8 @@ def build_dashboard(cameras):
         '    <span class="state-badge state-stopped" id="state-badge">Stopped</span>\n'
         '    <span class="motor-err" id="motor-err"></span>\n'
         '  </div>\n'
-        '  <div class="motor-conn-warn" id="conn-warn">Cannot reach motor Pi at '
-        + MOTOR_PI_IP + ':' + str(MOTOR_PORT) + '. Check that motor_server.py is running.</div>\n'
+        '  <div class="motor-conn-warn" id="conn-warn">Cannot reach the motor Pi on port '
+        + str(MOTOR_PORT) + '. Check the IP below and that motor_server.py is running.</div>\n'
         '  <div class="motor-btns">\n'
         '    <button class="mbtn mbtn-up"   id="btn-up"   onclick="motorCmd(\'up\')">'
         '<span class="mbtn-icon">&#8593;</span>UP</button>\n'
@@ -575,6 +958,15 @@ def build_dashboard(cameras):
         '<span class="mbtn-icon">&#9632;</span>STOP</button>\n'
         '    <button class="mbtn mbtn-down" id="btn-down" onclick="motorCmd(\'down\')">'
         '<span class="mbtn-icon">&#8595;</span>DOWN</button>\n'
+        '  </div>\n'
+        '  <div class="ip-row">\n'
+        '    <label class="ip-label" for="ip-input">Motor Pi IP</label>\n'
+        '    <input class="ip-input" id="ip-input" type="text" spellcheck="false"\n'
+        '           autocomplete="off" placeholder="100.x.x.x or hostname"/>\n'
+        '    <span style="color:var(--muted);font-family:monospace;font-size:.7rem">:'
+        + str(MOTOR_PORT) + '</span>\n'
+        '    <button class="ip-save" onclick="saveMotorIp()">Save</button>\n'
+        '    <span class="ip-status" id="ip-status"></span>\n'
         '  </div>\n'
         '  <div class="kbd-hint">\n'
         '    <div class="kh"><kbd>U</kbd> Door up</div>\n'
@@ -614,7 +1006,7 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
 
         if path == "/":
-            cameras = list_cameras()
+            cameras = get_cameras()
             body    = build_dashboard(cameras).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -624,18 +1016,41 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path == "/feed":
             device = self.parse_qs().get("device", "")
-            if not device or not os.path.exists(device):
+            # RealSense nodes are owned by the SDK (RSUSB backend detaches the
+            # kernel uvc driver, so /dev/videoN vanishes while streaming). Only
+            # filesystem-check UVC devices, which ffmpeg opens directly.
+            if not device or (not is_realsense_node(device)
+                              and not os.path.exists(device)):
                 self.send_error(400, "Bad device")
                 return
             self.send_response(200)
             self.send_header("Content-Type", "multipart/x-mixed-replace;boundary=frame")
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
-            cameras  = list_cameras()
-            cam_info = next((c for c in cameras if c["device"] == device), {})
-            kind     = cam_info.get("kind", "uvc")
-            stream   = get_stream(device, kind)
-            q        = stream.add_client()
+            peer = self.client_address[0]
+
+            if is_realsense_node(device):
+                # Single shared pipeline — no ffmpeg, no two-process race.
+                # kind is derived from the device, so no v4l2-ctl call needed.
+                hk = "intel" if device == REALSENSE_RGB_NODE else "ir"
+                q  = realsense_hub.add_client(hk)
+                print(f"[feed] +{peer} {device} ({hk}) viewers={len(realsense_hub.clients[hk])}")
+                try:
+                    while True:
+                        frame = q.get(timeout=10)
+                        self.wfile.write(
+                            b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+                        )
+                        self.wfile.flush()
+                except Exception as e:
+                    print(f"[feed] -{peer} {device} ({hk}) closed: {e}")
+                finally:
+                    realsense_hub.remove_client(hk, q)
+                return
+
+            stream = get_stream(device, "uvc")
+            q      = stream.add_client()
+            print(f"[feed] +{peer} {device} (uvc) viewers={len(stream.clients)}")
             try:
                 while True:
                     frame = q.get(timeout=10)
@@ -643,8 +1058,8 @@ class Handler(BaseHTTPRequestHandler):
                         b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
                     )
                     self.wfile.flush()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[feed] -{peer} {device} (uvc) closed: {e}")
             finally:
                 stream.remove_client(q)
 
@@ -655,11 +1070,19 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._json(502, {"error": result})
 
+        elif path == "/config":
+            self._json(200, {"motor_pi_ip": get_motor_ip(), "motor_port": MOTOR_PORT})
+
+        elif path == "/pipeline":
+            self._json(200, {"sdk": REALSENSE_SDK,
+                             "running": bool(realsense_hub and realsense_hub.is_running())})
+
         else:
             self.send_error(404)
 
     def do_POST(self):
-        if self.path.split("?")[0] != "/motor":
+        path = self.path.split("?")[0]
+        if path not in ("/motor", "/config", "/pipeline"):
             self.send_error(404)
             return
         length = int(self.headers.get("Content-Length", 0))
@@ -668,6 +1091,35 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             self._json(400, {"error": "bad json"})
             return
+
+        if path == "/config":
+            ok, result = set_motor_ip(data.get("motor_pi_ip", ""))
+            if ok:
+                self._json(200, {"ok": True, "motor_pi_ip": result})
+            else:
+                self._json(400, {"ok": False, "error": result})
+            return
+
+        if path == "/pipeline":
+            if not realsense_hub:
+                self._json(400, {"ok": False, "error": "RealSense SDK not available"})
+                return
+            action = data.get("action", "")
+            if action == "stop":
+                realsense_hub.stop()
+                self._json(200, {"ok": True, "running": False})
+            elif action == "restart":
+                try:
+                    delay = float(data.get("delay", 2.0))
+                except (TypeError, ValueError):
+                    delay = 2.0
+                delay = max(0.0, min(delay, 30.0))   # clamp to a sane range
+                realsense_hub.restart(delay)
+                self._json(200, {"ok": True, "delay": delay})
+            else:
+                self._json(400, {"ok": False, "error": f"unknown action: {action}"})
+            return
+
         cmd = data.get("cmd", "")
         if cmd not in ("up", "down", "stop"):
             self._json(400, {"error": f"unknown cmd: {cmd}"})
@@ -679,13 +1131,40 @@ class Handler(BaseHTTPRequestHandler):
             self._json(502, {"ok": False, "error": result})
 
 
+def _cleanup():
+    """Release the RealSense device on exit so the next start isn't blocked."""
+    if realsense_hub is not None:
+        print("[dashboard] releasing RealSense device...")
+        realsense_hub.stop()
+
+
 if __name__ == "__main__":
+    import signal, atexit
+
+    _load_config()
+    cams = get_cameras(force=True)     # warm the cache while the device is idle
+    print(f"[dashboard] cameras: {[c['name'] for c in cams] or 'none'}")
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     server.daemon_threads = True
     print(f"[dashboard] http://0.0.0.0:{PORT}")
     print(f"[dashboard] phone  -> http://100.86.37.14:{PORT}")
-    print(f"[dashboard] motor  -> {MOTOR_BASE}")
+    print(f"[dashboard] motor  -> {motor_base()}")
+
+    atexit.register(_cleanup)
+
+    # systemd sends SIGTERM (not KeyboardInterrupt) on stop/restart. Translate it
+    # to KeyboardInterrupt so it propagates out of serve_forever in THIS (main)
+    # thread — calling server.shutdown() from the handler would deadlock, since
+    # shutdown() blocks waiting on the very loop the handler interrupted.
+    def _on_signal(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _on_signal)
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n[dashboard] shutting down.")
+    finally:
+        _cleanup()                 # idempotent; atexit also covers hard paths
+        print("[dashboard] shut down.")

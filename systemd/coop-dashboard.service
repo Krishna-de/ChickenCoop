@@ -3,11 +3,13 @@ Description=Coop Dashboard
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/python3 /home/pi5/ChickenCoop/dashboard.py
+ExecStart=/usr/bin/python3 -u /home/pi5/ChickenCoop/dashboard.py
 WorkingDirectory=/home/pi5/ChickenCoop
 User=pi5
 Restart=always
 RestartSec=5
+# -u / PYTHONUNBUFFERED: flush print() straight to the journal (no buffering)
+Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=multi-user.target

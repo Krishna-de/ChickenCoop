@@ -138,6 +138,63 @@ Motor state polls every 4 seconds. Shows offline warning if motor Pi is unreacha
 
 ---
 
+## Service management
+
+Both `dashboard.py` and `motor_server.py` run as systemd services (`coop-dashboard` on the camera Pi, `motor-server` on the motor Pi). Use the matching service name for the Pi you are on.
+
+### Live logs
+
+```bash
+# follow logs in real time (Ctrl-C to stop following — does NOT stop the service)
+journalctl -u coop-dashboard -f
+
+# last 200 lines, then follow
+journalctl -u coop-dashboard -n 200 -f
+
+# logs since the last boot
+journalctl -u coop-dashboard -b
+
+# logs from the last 15 minutes
+journalctl -u coop-dashboard --since "15 min ago"
+```
+
+These show the app's own output — camera enumeration, `[realsense] pipeline started`, per-viewer `[feed] +…` connects, and motor errors.
+
+### Status, start/stop, restart
+
+```bash
+systemctl status coop-dashboard          # running? shows the loaded unit path + recent log lines
+sudo systemctl restart coop-dashboard    # restart (SIGTERM releases the RealSense cleanly)
+sudo systemctl stop coop-dashboard       # stop
+sudo systemctl start coop-dashboard      # start
+sudo systemctl enable coop-dashboard     # start automatically on boot
+```
+
+### Edit the service file
+
+The installed unit (the one systemd runs) lives at `/etc/systemd/system/`. The repo keeps a source copy under `systemd/`.
+
+```bash
+# find the live unit path
+systemctl status coop-dashboard          # see the "Loaded:" line
+
+# edit it directly
+sudo nano /etc/systemd/system/coop-dashboard.service
+
+# OR edit the repo copy and redeploy
+nano systemd/coop-dashboard.service
+sudo ./install.sh dashboard
+```
+
+After **any** change to a `.service` file, reload systemd before restarting (it caches unit files):
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart coop-dashboard
+```
+
+---
+
 ## Troubleshooting
 
 **IR stream blank** — try increasing `IR_START_DELAY = 3.0` in `dashboard.py`
