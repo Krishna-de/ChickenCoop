@@ -1,0 +1,6 @@
+# Camera Pi (dashboard.py) — stdlib only
+# System packages: sudo apt install ffmpeg v4l-utils python3
+
+# Motor Pi (motor_server.py)
+# System packages: sudo apt install python3-rpi.gpio python3
+RPi.GPIO>=0.7.0

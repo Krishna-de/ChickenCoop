@@ -1,0 +1,13 @@
+[Unit]
+Description=Coop Motor Server
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/chickenpi/ChickenCoop/motor_server.py
+WorkingDirectory=/home/chickenpi/ChickenCoop
+User=chickenpi
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
