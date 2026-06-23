@@ -26,13 +26,14 @@ DELAY_MIN    = 0.003
 RAMP_STEPS   = 30
 
 PORT         = 8081
+VERSION      = "1.1.0"
 
 # ── motor state ───────────────────────────────────────────────────────────────
-running      = False
-direction    = True   # True = CW (up)
+stop_evt     = threading.Event()   # set => the stepping loop must exit now
 motor_thread = None
 state_label  = "stopped"
-state_lock   = threading.Lock()
+state_lock   = threading.Lock()    # guards state_label
+cmd_lock     = threading.Lock()    # serializes start/stop so only one worker runs
 
 
 def setup():
@@ -59,11 +60,11 @@ def step_once(delay):
     time.sleep(delay)
 
 
-def run_continuous():
-    global running
-    i = 0
+def run_continuous(cw):
+    GPIO.output(DIR_PIN, GPIO.HIGH if cw else GPIO.LOW)
     enable()
-    while running:
+    i = 0
+    while not stop_evt.is_set():
         if i < RAMP_STEPS:
             t     = i / RAMP_STEPS
             t     = 0.5 - 0.5 * math.cos(math.pi * t)
@@ -73,38 +74,40 @@ def run_continuous():
         step_once(delay)
         i += 1
     disable()
+    print("[motor] stepping thread exited")
+
+
+def _stop_locked():
+    """Stop the worker. Caller must hold cmd_lock."""
+    global motor_thread, state_label
+    stop_evt.set()
+    if motor_thread and motor_thread.is_alive():
+        motor_thread.join(timeout=2)
+    motor_thread = None
+    with state_lock:
+        state_label = "stopped"
 
 
 def start_motor(cw=True):
-    global running, direction, motor_thread, state_label
-    if running:
-        _stop()
-    with state_lock:
-        direction   = cw
-        state_label = "up" if cw else "down"
-    GPIO.output(DIR_PIN, GPIO.HIGH if cw else GPIO.LOW)
-    running      = True
-    motor_thread = threading.Thread(target=run_continuous, daemon=True)
-    motor_thread.start()
-    print(f"[motor] {'UP (CW)' if cw else 'DOWN (CCW)'}")
-
-
-def _stop():
-    global running, state_label
-    running = False
-    if motor_thread:
-        motor_thread.join(timeout=2)
-    with state_lock:
-        state_label = "stopped"
-    print("[motor] stopped")
+    global motor_thread, state_label
+    with cmd_lock:
+        _stop_locked()                 # ensure no existing worker
+        stop_evt.clear()
+        with state_lock:
+            state_label = "up" if cw else "down"
+        motor_thread = threading.Thread(target=run_continuous, args=(cw,), daemon=True)
+        motor_thread.start()
+    print(f"[motor] start {'UP (CW)' if cw else 'DOWN (CCW)'}")
 
 
 def stop_motor():
-    _stop()
+    with cmd_lock:
+        _stop_locked()
+    print("[motor] stop")
 
 
 def shutdown(sig=None, frame=None):
-    _stop()
+    stop_motor()
     disable()
     GPIO.cleanup()
     print("[motor] shutdown")
@@ -140,7 +143,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.split("?")[0] == "/motor":
             with state_lock:
-                self._json(200, {"state": state_label})
+                self._json(200, {"state": state_label, "version": VERSION})
         else:
             self._json(404, {"error": "not found"})
 
@@ -155,6 +158,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": "bad json"})
             return
         cmd = data.get("cmd", "")
+        print(f"[motor] POST cmd={cmd!r} from {self.client_address[0]}")
         if cmd == "up":
             start_motor(cw=True)
         elif cmd == "down":
@@ -173,5 +177,5 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT,  shutdown)
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"[motor_server] listening on port {PORT}")
+    print(f"[motor_server] v{VERSION} listening on port {PORT}")
     server.serve_forever()

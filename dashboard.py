@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""
+""" 
 dashboard.py — runs on the CAMERA Pi
 Serves the unified coop dashboard:
   - RealSense RGB (left) + IR (right) auto-assigned on load
@@ -70,6 +70,7 @@ def encode_jpeg(arr, gray, quality=80):
     return None
 
 # ── config ────────────────────────────────────────────────────────────────────
+VERSION     = "1.1.0"
 PORT        = 8080
 FPS         = 10          # ffmpeg/UVC: lower FPS reduces USB bandwidth contention
 REALSENSE_FPS = 15        # SDK serves both streams from one handle — no bandwidth race,
@@ -89,6 +90,10 @@ REALSENSE_IR_NODE  = "/dev/video2"
 
 # Delay before IR stream opens — gives RGB time to negotiate the device first
 IR_START_DELAY = 2.0
+
+# Keep a UVC ffmpeg stream alive this long after the last viewer leaves, so a
+# page refresh reuses it instead of racing a stop→start re-open (device busy).
+IDLE_GRACE = 5.0
 
 ALLOWED_KEYWORDS = ["uvc", "intel", "realsense", "real sense",
                     "webcam", "usb camera", "usb2.0", "usb3", "general"]
@@ -186,6 +191,36 @@ class CameraStream:
         self.clients = []
         self.running = False
         self.thread  = None
+        self.proc    = None      # the live ffmpeg subprocess, for external stop
+
+    def stop(self):
+        """Stop streaming and kill the ffmpeg child. Without this an abrupt
+        process exit orphans ffmpeg, leaving /dev/videoN held."""
+        with self.lock:
+            self.running = False
+            t = self.thread
+            p = self.proc
+        if p is not None:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        if t and t.is_alive():
+            t.join(timeout=4)
+
+    def restart(self, delay=2.0):
+        """Kill ffmpeg, wait `delay`s, then respawn it if viewers remain — the
+        client queues are kept, so video resumes without a reconnect. Runs in a
+        background thread so the HTTP request returns immediately."""
+        def worker():
+            self.stop()                       # keeps client queues intact
+            if delay > 0:
+                time.sleep(delay)
+            with self.lock:
+                if self.clients and not self.running:
+                    self._start()
+                    print(f"[cam:{self.kind}] restarted {self.device} after {delay}s")
+        threading.Thread(target=worker, daemon=True).start()
 
     def add_client(self):
         q = queue.Queue(maxsize=5)
@@ -235,11 +270,22 @@ class CameraStream:
             ffmpeg = subprocess.Popen(cmd,
                                       stdout=subprocess.PIPE,
                                       stderr=subprocess.DEVNULL)
+            self.proc = ffmpeg
             buf = b""
+            idle_since = None          # when clients last dropped to zero
             try:
-                while True:
+                while self.running:
                     with self.lock:
-                        if not self.clients:
+                        has_clients = bool(self.clients)
+                    # Keep ffmpeg (and the device) open through a short idle grace
+                    # so a page refresh reuses it instead of racing a stop→start
+                    # re-open, which fails with "device busy" on a UVC node.
+                    if has_clients:
+                        idle_since = None
+                    else:
+                        if idle_since is None:
+                            idle_since = time.time()
+                        elif time.time() - idle_since > IDLE_GRACE:
                             break
                     chunk = ffmpeg.stdout.read(4096)
                     if not chunk:
@@ -262,6 +308,7 @@ class CameraStream:
             finally:
                 ffmpeg.terminate()
                 ffmpeg.wait()
+                self.proc = None
 
             with self.lock:
                 if not self.clients:
@@ -497,6 +544,15 @@ def motor_get():
         return False, str(e)
 
 
+def motor_version():
+    """Fetch the motor Pi's reported version. Returns the string or None."""
+    try:
+        with urlopen(motor_base(), timeout=3) as r:
+            return json.loads(r.read()).get("version")
+    except Exception:
+        return None
+
+
 # ── HTML ──────────────────────────────────────────────────────────────────────
 
 def cam_json(cameras):
@@ -531,18 +587,32 @@ header{width:100%;max-width:1100px;display:flex;align-items:center;gap:14px;flex
   padding:3px 8px;border-radius:20px;text-transform:uppercase}
 .pill-on{background:var(--green-dim);color:var(--green);border:1px solid rgba(0,201,125,.3)}
 .pill-off{background:var(--red-dim);color:var(--red);border:1px solid rgba(255,76,76,.3)}
+.ver{font-family:monospace;font-size:.6rem;color:var(--muted);letter-spacing:.04em}
 .section-label{width:100%;max-width:1100px;font-family:monospace;font-size:.65rem;
   font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);
   border-bottom:1px solid var(--border);padding-bottom:6px}
-.cam-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;width:100%;max-width:1100px}
-@media(max-width:600px){.cam-grid{grid-template-columns:1fr}}
+.tabs{width:100%;max-width:1100px;display:flex;gap:4px;border-bottom:1px solid var(--border)}
+.tab{font-family:monospace;font-size:.72rem;font-weight:700;letter-spacing:.06em;
+  text-transform:uppercase;padding:11px 20px;cursor:pointer;color:var(--muted);
+  background:transparent;border:none;border-bottom:2px solid transparent;margin-bottom:-1px}
+.tab:hover{color:var(--text)}
+.tab.active{color:var(--green);border-bottom-color:var(--green)}
+.tab-panel{display:none;width:100%;max-width:1100px;flex-direction:column;
+  gap:20px;align-items:center}
+.tab-panel.active{display:flex}
+.cam-grid{display:grid;gap:12px;width:100%;max-width:1100px;
+  grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
 .panel{position:relative;background:#000;border:1px solid var(--border);
   border-radius:var(--r);overflow:hidden;aspect-ratio:4/3;
   display:flex;align-items:center;justify-content:center}
 .panel.left{border-color:var(--green)}
 .panel.right{border-color:var(--purple)}
+.panel.third{border-color:var(--blue)}
 .panel.right::after{content:'';position:absolute;inset:0;
   background:linear-gradient(135deg,rgba(181,122,255,.04) 0%,transparent 60%);
+  pointer-events:none}
+.panel.third::after{content:'';position:absolute;inset:0;
+  background:linear-gradient(135deg,rgba(58,143,255,.04) 0%,transparent 60%);
   pointer-events:none}
 .panel img{width:100%;height:100%;object-fit:contain;display:block}
 .ph{color:var(--muted);font-family:monospace;font-size:.75rem;text-align:center;line-height:2}
@@ -551,24 +621,32 @@ header{width:100%;max-width:1100px;display:flex;align-items:center;gap:14px;flex
 .badge{position:absolute;top:9px;right:9px;color:#fff;font-family:monospace;
   font-size:.58rem;font-weight:700;letter-spacing:.12em;padding:2px 7px;
   border-radius:4px;animation:pulse 2s infinite}
-.badge.L{background:var(--live)}.badge.R{background:#7c3aed}
+.badge.L{background:var(--live)}.badge.R{background:#7c3aed}.badge.C{background:var(--blue)}
 .plbl{position:absolute;top:9px;left:9px;font-family:monospace;font-size:.58rem;
   font-weight:700;padding:2px 7px;border-radius:4px}
 .plbl.L{background:rgba(0,201,125,.18);color:var(--green)}
 .plbl.R{background:rgba(181,122,255,.18);color:var(--purple)}
+.plbl.C{background:rgba(58,143,255,.18);color:var(--blue)}
 .slbl{position:absolute;bottom:9px;left:9px;font-family:monospace;font-size:.6rem;
   padding:2px 8px;border-radius:4px;background:rgba(0,0,0,.55);color:var(--text);
   max-width:55%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.disc{position:absolute;bottom:9px;right:9px;font-family:monospace;font-size:.62rem;
+.panel-ctrls{position:absolute;bottom:9px;right:9px;display:flex;gap:6px;align-items:center}
+.disc{font-family:monospace;font-size:.62rem;
   font-weight:700;padding:4px 10px;border-radius:6px;cursor:pointer;
   border:1px solid rgba(255,76,76,.35);background:rgba(255,76,76,.1);color:var(--red)}
 .disc:hover{background:rgba(255,76,76,.25)}
+.rst{font-family:monospace;font-size:.62rem;font-weight:700;padding:4px 10px;
+  border-radius:6px;cursor:pointer;border:1px solid rgba(58,143,255,.35);
+  background:rgba(58,143,255,.1);color:var(--blue)}
+.rst:hover{background:rgba(58,143,255,.25)}
+.rst:disabled{opacity:.5;cursor:default}
 .re-msg{display:flex;flex-direction:column;align-items:center;justify-content:center;
   gap:10px;width:100%;height:100%;color:var(--muted);font-family:monospace;font-size:.75rem}
 .re-btn{font-family:monospace;font-size:.66rem;font-weight:700;padding:5px 14px;
   border-radius:6px;cursor:pointer}
 .re-btn.L{background:var(--green-dim);color:var(--green);border:1px solid rgba(0,201,125,.35)}
 .re-btn.R{background:var(--purple-dim);color:var(--purple);border:1px solid rgba(181,122,255,.4)}
+.re-btn.C{background:var(--blue-dim);color:var(--blue);border:1px solid rgba(58,143,255,.4)}
 .pipe-ctrl{display:flex;align-items:center;gap:12px;flex-wrap:wrap;width:100%;
   max-width:1100px;background:var(--surface);border:1px solid var(--border);
   border-radius:var(--r);padding:10px 16px}
@@ -589,31 +667,6 @@ header{width:100%;max-width:1100px;display:flex;align-items:center;gap:14px;flex
 .pc-delay input{width:56px;font-family:monospace;font-size:.72rem;color:var(--text);
   background:var(--bg);border:1px solid var(--border);border-radius:5px;padding:4px 6px}
 .pipe-status{font-family:monospace;font-size:.7rem;margin-left:auto}
-.cam-list{display:flex;flex-wrap:wrap;gap:10px;width:100%;max-width:1100px}
-.cam-row{display:flex;align-items:center;gap:10px;padding:10px 14px;
-  background:var(--surface);border:1px solid var(--border);border-radius:var(--r);flex:1 1 240px}
-.cam-row.aL{border-color:var(--green);background:#0a1910}
-.cam-row.aR{border-color:var(--purple);background:#120a1f}
-.tag{font-family:monospace;font-size:.58rem;font-weight:700;letter-spacing:.1em;
-  padding:2px 6px;border-radius:4px;text-transform:uppercase;flex-shrink:0}
-.tag-uvc  {background:rgba(0,201,125,.15);color:var(--green);border:1px solid rgba(0,201,125,.3)}
-.tag-intel{background:rgba(58,143,255,.15);color:var(--blue);border:1px solid rgba(58,143,255,.3)}
-.tag-ir   {background:rgba(181,122,255,.15);color:var(--purple);border:1px solid rgba(181,122,255,.3)}
-.ci{display:flex;flex-direction:column;gap:3px;flex:1}
-.ci strong{font-size:.85rem}
-.ci small{font-family:monospace;font-size:.66rem;color:var(--muted)}
-.auto-badge{font-family:monospace;font-size:.56rem;font-weight:700;
-  padding:1px 5px;border-radius:3px;letter-spacing:.08em;display:inline-block;margin-top:2px}
-.auto-L{background:var(--green-dim);color:var(--green);border:1px solid rgba(0,201,125,.3)}
-.auto-R{background:var(--purple-dim);color:var(--purple);border:1px solid rgba(181,122,255,.3)}
-.sbtns{display:flex;gap:6px;margin-left:auto}
-.sb{font-family:monospace;font-size:.68rem;font-weight:700;padding:4px 11px;
-  border-radius:5px;cursor:pointer;border:1px solid var(--border);
-  background:transparent;color:var(--muted)}
-.sb:hover{border-color:var(--green2);color:var(--text)}
-.sb.aL{border-color:rgba(0,201,125,.6);color:var(--green);background:var(--green-dim)}
-.sb.aR{border-color:rgba(181,122,255,.6);color:var(--purple);background:var(--purple-dim)}
-.no-cams{color:var(--muted);font-family:monospace;font-size:.82rem}
 .motor-panel{width:100%;max-width:1100px;background:var(--surface);
   border:1px solid var(--border);border-radius:var(--r);padding:20px 24px;
   display:flex;flex-direction:column;gap:16px}
@@ -660,67 +713,56 @@ header{width:100%;max-width:1100px;display:flex;align-items:center;gap:14px;flex
 kbd{background:var(--border);border:1px solid #2e3440;border-radius:4px;
   padding:2px 7px;font-size:.65rem;color:var(--text)}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.55}}
+
+/* ── Mobile (phones / portrait) ─────────────────────────────────── */
+@media(max-width:640px){
+  body{padding:12px 10px 40px;gap:14px}
+  .logo{font-size:.85rem}
+  header{gap:8px}
+  /* keyboard shortcut hints are desktop-only */
+  .kbd-hint{display:none}
+  /* full-width, bigger touch targets */
+  .motor-panel{padding:16px}
+  .motor-btns{gap:8px}
+  .mbtn{padding:18px 14px;font-size:.8rem;min-width:0;flex:1 1 28%}
+  .mbtn-stop{flex:1 1 28%}
+  .mbtn-icon{font-size:1.6rem}
+  .disc,.rst{font-size:.66rem;padding:7px 12px}
+  .ip-row{gap:8px}
+  .ip-input{flex:1 1 100%;min-width:0;padding:10px 12px;font-size:.85rem}
+  .ip-save{flex:1 1 100%;padding:10px}
+  .pipe-ctrl{gap:8px;padding:10px 12px}
+  .pc-btn{padding:9px 16px;font-size:.72rem}
+  .pipe-status{margin-left:0;flex:1 1 100%}
+}
+/* coarse pointers (touch): never rely on hover-only affordances */
+@media(hover:none){
+  .mbtn:hover,.disc:hover,.rst:hover,.ip-save:hover,
+  .pc-stop:hover,.pc-restart:hover{opacity:1}
+}
 """
 
 HTML_JS = """
 var CAMS  = CAMS_JSON;
-var slots = {L: null, R: null};
+var slots = {L: null, R: null, C: null};
+var PANEL = {L: 'left', R: 'right', C: 'third'};
+function kindLabel(kind){ return kind === 'ir' ? 'IR' : kind === 'uvc' ? 'UVC' : 'RGB'; }
 
-var list = document.getElementById('cam-list');
-CAMS.forEach(function(cam) {
-  var row = document.createElement('div');
-  row.className = 'cam-row';
-
-  var tag = document.createElement('span');
-  tag.className = 'tag tag-' + cam.kind;
-  tag.textContent = cam.kind === 'ir' ? 'IR' : cam.kind.toUpperCase();
-
-  var ci = document.createElement('div');
-  ci.className = 'ci';
-  var nameEl = document.createElement('strong');
-  nameEl.textContent = cam.name;
-  var devEl = document.createElement('small');
-  devEl.textContent = cam.device;
-  ci.appendChild(nameEl);
-  ci.appendChild(devEl);
-  if (cam.auto) {
-    var ab = document.createElement('span');
-    ab.className = 'auto-badge auto-' + cam.auto;
-    ab.textContent = 'AUTO ' + cam.auto;
-    ci.appendChild(ab);
-  }
-
-  var sbtns = document.createElement('div');
-  sbtns.className = 'sbtns';
-  var bL = document.createElement('button');
-  bL.className = 'sb'; bL.textContent = 'L';
-  bL.onclick = function(){ assign('L', cam); };
-  var bR = document.createElement('button');
-  bR.className = 'sb'; bR.textContent = 'R';
-  bR.onclick = function(){ assign('R', cam); };
-  sbtns.appendChild(bL); sbtns.appendChild(bR);
-
-  row.appendChild(tag); row.appendChild(ci); row.appendChild(sbtns);
-  list.appendChild(row);
-  cam._row = row; cam._bL = bL; cam._bR = bR;
-});
+function showTab(name){
+  ['live', 'door'].forEach(function(t){
+    document.getElementById('tab-' + t).classList.toggle('active', t === name);
+    document.getElementById('tab-btn-' + t).classList.toggle('active', t === name);
+  });
+}
 
 function assign(slot, cam) {
-  CAMS.forEach(function(c) {
-    if (slots[slot] === c.device) {
-      c._row.classList.remove(slot === 'L' ? 'aL' : 'aR');
-      (slot === 'L' ? c._bL : c._bR).classList.remove(slot === 'L' ? 'aL' : 'aR');
-    }
-  });
   slots[slot] = cam.device;
-  cam._row.classList.add(slot === 'L' ? 'aL' : 'aR');
-  (slot === 'L' ? cam._bL : cam._bR).classList.add(slot === 'L' ? 'aL' : 'aR');
   startStream(slot, cam.device, cam.name, cam.kind);
 }
 
 function startStream(slot, device, name, kind) {
   var panel = document.getElementById('p' + slot);
-  panel.className = 'panel ' + (slot === 'L' ? 'left' : 'right');
+  panel.className = 'panel ' + PANEL[slot];
 
   var img = document.createElement('img');
   img.id  = 'img' + slot;
@@ -728,7 +770,7 @@ function startStream(slot, device, name, kind) {
 
   var lbl = document.createElement('div');
   lbl.className = 'plbl ' + slot;
-  lbl.textContent = kind === 'ir' ? 'IR' : 'RGB';
+  lbl.textContent = kindLabel(kind);
 
   var badge = document.createElement('div');
   badge.className = 'badge ' + slot;
@@ -738,14 +780,39 @@ function startStream(slot, device, name, kind) {
   slbl.className = 'slbl';
   slbl.textContent = name;
 
+  var ctrls = document.createElement('div');
+  ctrls.className = 'panel-ctrls';
+
+  // Forced restart-with-delay for UVC (RealSense uses the pipeline bar instead).
+  if (kind === 'uvc') {
+    var rst = document.createElement('button');
+    rst.className = 'rst';
+    rst.textContent = '\\u21BB Restart';
+    rst.onclick = function(){ restartFeed(device, rst); };
+    ctrls.appendChild(rst);
+  }
+
   var disc = document.createElement('button');
   disc.className = 'disc';
   disc.textContent = '\\u25A0 Disconnect';
   disc.onclick = function(){ disconnect(slot, device); };
+  ctrls.appendChild(disc);
 
   panel.innerHTML = '';
   panel.appendChild(img); panel.appendChild(lbl);
-  panel.appendChild(badge); panel.appendChild(slbl); panel.appendChild(disc);
+  panel.appendChild(badge); panel.appendChild(slbl); panel.appendChild(ctrls);
+}
+
+function restartFeed(device, btn) {
+  var old = btn ? btn.textContent : '';
+  if (btn) { btn.textContent = '\\u21BB\\u2026'; btn.disabled = true; }
+  fetch('/pipeline', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({action:'restart', delay: 2, device: device})})
+  .then(function(r){ return r.json(); })
+  .catch(function(){})
+  .then(function(){
+    setTimeout(function(){ if (btn) { btn.textContent = old; btn.disabled = false; } }, 3000);
+  });
 }
 
 function disconnect(slot, device) {
@@ -763,24 +830,19 @@ function disconnect(slot, device) {
   };
   msg.appendChild(txt); msg.appendChild(btn);
   panel.innerHTML = ''; panel.appendChild(msg);
-  CAMS.forEach(function(c){
-    if (c.device === device){
-      c._row.classList.remove(slot === 'L' ? 'aL' : 'aR');
-      (slot === 'L' ? c._bL : c._bR).classList.remove(slot === 'L' ? 'aL' : 'aR');
-    }
-  });
   slots[slot] = null;
 }
 
-// Deterministic layout by kind: RGB -> Left, IR -> Right. (The 'auto' field
-// and node order are not trusted here.) UVC cams fill any leftover slot, but
-// only AFTER IR is placed so they can't steal the right panel.
+// Deterministic layout by kind: RGB -> Left, IR -> Right, UVC -> Center (third).
+// (The 'auto' field and node order are not trusted here.) Extra UVC cams fall
+// back to any leftover slot, placed only AFTER IR so they can't steal a panel.
 var rgbCam = CAMS.find(function(c){ return c.kind === 'intel'; });
 var irCam  = CAMS.find(function(c){ return c.kind === 'ir'; });
 function fillUVC(){
   CAMS.forEach(function(cam){
     if (cam.kind !== 'uvc') return;
-    if (!slots.L) assign('L', cam);
+    if (!slots.C) assign('C', cam);          // UVC -> third pane
+    else if (!slots.L) assign('L', cam);
     else if (!slots.R) assign('R', cam);
   });
 }
@@ -840,13 +902,24 @@ function saveMotorIp() {
     body: JSON.stringify({motor_pi_ip: ip})})
   .then(function(r){ return r.json(); })
   .then(function(d){
-    if (d.ok) { st.textContent = 'Saved \\u2713'; st.style.color = 'var(--green)'; pollMotor(); }
+    if (d.ok) { st.textContent = 'Saved \\u2713'; st.style.color = 'var(--green)'; pollMotor(); loadVersions(); }
     else      { st.textContent = d.error || 'error'; st.style.color = 'var(--red)'; }
     setTimeout(function(){ st.textContent = ''; }, 3000);
   })
   .catch(function(){ st.textContent = 'Network error'; st.style.color = 'var(--red)'; });
 }
 loadConfig();
+
+// dashboard + motor server versions
+function loadVersions() {
+  fetch('/version').then(function(r){ return r.json(); })
+  .then(function(d){
+    var el = document.getElementById('ver');
+    if (el) el.innerHTML = 'dash v' + (d.dashboard || '?') +
+                           ' \\u00B7 motor v' + (d.motor || '\\u2014');
+  }).catch(function(){});
+}
+loadVersions();
 
 // RealSense pipeline control (only present when SDK active)
 function setPipeBadge(running) {
@@ -902,7 +975,6 @@ document.addEventListener('keydown', function(e){
 def build_dashboard(cameras):
     cjson   = cam_json(cameras)
     n       = len(cameras)
-    no_cams = "" if cameras else '<p class="no-cams">No cameras detected.</p>'
     # SDK serves both streams from one handle, so the IR open can be instant;
     # the ffmpeg fallback still needs the stagger to dodge the USB race.
     ir_delay = "0" if REALSENSE_SDK else "2500"
@@ -932,17 +1004,26 @@ def build_dashboard(cameras):
         '<header>\n'
         '  <span class="logo">&#127313; Coop <span>// dashboard</span></span>\n'
         '  <span class="pill pill-on" id="conn-pill">Motor Pi</span>\n'
-        '  <span style="font-family:monospace;font-size:.65rem;color:var(--muted);margin-left:auto">'
+        '  <span class="ver" id="ver" title="dashboard / motor server versions" '
+        'style="margin-left:auto">dash v' + VERSION + ' &middot; motor v&hellip;</span>\n'
+        '  <span style="font-family:monospace;font-size:.65rem;color:var(--muted)">'
         + str(n) + ' camera(s)</span>\n'
         '</header>\n'
-        '<div class="section-label">&#128247; Live cameras</div>\n'
+        '<nav class="tabs" role="tablist">\n'
+        '  <button class="tab active" id="tab-btn-live" onclick="showTab(\'live\')">'
+        '&#128247; Live</button>\n'
+        '  <button class="tab" id="tab-btn-door" onclick="showTab(\'door\')">'
+        '&#9881; Door control</button>\n'
+        '</nav>\n'
+        '<section class="tab-panel active" id="tab-live">\n'
         '<div class="cam-grid">\n'
         '  <div class="panel" id="pL"><div class="ph"><span>RGB</span>Loading&hellip;</div></div>\n'
         '  <div class="panel" id="pR"><div class="ph"><span>IR</span>Loading&hellip;</div></div>\n'
+        '  <div class="panel" id="pC"><div class="ph"><span>UVC</span>Loading&hellip;</div></div>\n'
         '</div>\n'
         + pipe_ctrl +
-        '<div class="cam-list" id="cam-list">' + no_cams + '</div>\n'
-        '<div class="section-label">&#9881; Door motor</div>\n'
+        '</section>\n'
+        '<section class="tab-panel" id="tab-door">\n'
         '<div class="motor-panel">\n'
         '  <div class="motor-status-row">\n'
         '    <span class="motor-title">NEMA 17 // A4988</span>\n'
@@ -974,6 +1055,7 @@ def build_dashboard(cameras):
         '    <div class="kh"><kbd>S</kbd> Stop</div>\n'
         '  </div>\n'
         '</div>\n'
+        '</section>\n'
         '<script>\n' + js + '\n</script>\n'
         '</body>\n</html>'
     )
@@ -1077,6 +1159,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"sdk": REALSENSE_SDK,
                              "running": bool(realsense_hub and realsense_hub.is_running())})
 
+        elif path == "/version":
+            self._json(200, {"dashboard": VERSION, "motor": motor_version()})
+
         else:
             self.send_error(404)
 
@@ -1101,12 +1186,24 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/pipeline":
-            if not realsense_hub:
-                self._json(400, {"ok": False, "error": "RealSense SDK not available"})
-                return
             action = data.get("action", "")
+            device = data.get("device", "")
+
+            # Pick the target: a specific UVC device, or the shared RealSense hub.
+            if device and not is_realsense_node(device):
+                with _streams_lock:
+                    target = _streams.get(device)
+                if target is None:
+                    self._json(400, {"ok": False, "error": "no active stream for device"})
+                    return
+            else:
+                target = realsense_hub
+                if target is None:
+                    self._json(400, {"ok": False, "error": "RealSense SDK not available"})
+                    return
+
             if action == "stop":
-                realsense_hub.stop()
+                target.stop()
                 self._json(200, {"ok": True, "running": False})
             elif action == "restart":
                 try:
@@ -1114,7 +1211,7 @@ class Handler(BaseHTTPRequestHandler):
                 except (TypeError, ValueError):
                     delay = 2.0
                 delay = max(0.0, min(delay, 30.0))   # clamp to a sane range
-                realsense_hub.restart(delay)
+                target.restart(delay)
                 self._json(200, {"ok": True, "delay": delay})
             else:
                 self._json(400, {"ok": False, "error": f"unknown action: {action}"})
@@ -1132,10 +1229,16 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def _cleanup():
-    """Release the RealSense device on exit so the next start isn't blocked."""
+    """Release all camera devices on exit so the next start isn't blocked:
+    stop the RealSense pipeline and kill every UVC ffmpeg subprocess."""
     if realsense_hub is not None:
         print("[dashboard] releasing RealSense device...")
         realsense_hub.stop()
+    with _streams_lock:
+        streams = list(_streams.values())
+    for s in streams:
+        print(f"[dashboard] stopping ffmpeg for {s.device}...")
+        s.stop()
 
 
 if __name__ == "__main__":
