@@ -84,24 +84,78 @@ cd ChickenCoop
 
 ## Remote access (Tailscale)
 
+Tailscale puts both Pis and your phone on one private WireGuard network. **No port forwarding, nothing exposed to the internet**, and it works from behind CGNAT. The free personal tier covers this project (up to 100 devices).
+
+### 1. Create an account
+
+Sign up at [tailscale.com](https://tailscale.com) (Google/GitHub/Microsoft login). Use the **same account** on every device below — that's what puts them on one network.
+
+### 2. Install on both Pis
+
+Run on the **camera Pi** and the **motor Pi**:
+
 ```bash
-# install on each Pi
 curl -fsSL https://tailscale.com/install.sh | sh
 sudo tailscale up
-
-# get the Pi's IP
-tailscale ip
 ```
 
-Install the Tailscale app on your phone and sign in with the same account. Then open:
+`tailscale up` prints an authentication URL. Open it in any browser and sign in — that links the Pi to your account. The `tailscaled` service is enabled on boot automatically, so this survives reboots.
+
+### 3. Get each Pi's IP
+
+```bash
+tailscale ip -4        # this machine, e.g. 100.86.37.14
+tailscale status       # every device on your network + its IP
+```
+
+Tailscale IPs always start with `100.` and are **stable** — they don't change on reboot or when you move networks.
+
+### 4. Stop the keys from expiring
+
+By default a device's auth key expires (~180 days) and the Pi silently drops off the network — bad for a headless coop. Fix it once:
+
+**Admin console → Machines → ⋯ next to each Pi → Disable key expiry.**
+
+### 5. Point the dashboard at the motor Pi
+
+Open the dashboard and put the **motor Pi's** Tailscale IP in the *Motor Pi IP* box, then Save. It's persisted to `dashboard_config.json` — no code edit, no restart.
+
+Verify the two Pis can see each other (run on the camera Pi):
+```bash
+ping -c 3 <motor-pi-tailscale-ip>
+curl http://<motor-pi-tailscale-ip>:8081/motor    # should return JSON
+```
+
+### 6. Phone access
+
+Install the Tailscale app (iOS/Android), sign in with the same account, toggle the VPN on. Then open:
 ```
 http://<camera-pi-tailscale-ip>:8080
 ```
 
-For HTTPS with a real certificate:
+### Optional: nicer hostnames (MagicDNS)
+
+Enable **MagicDNS** in the admin console (DNS tab) and use names instead of IPs:
+```
+http://camera-pi:8080
+```
+
+### Optional: real HTTPS
+
+Gives a valid certificate (no browser warning) on a `*.ts.net` name:
 ```bash
 sudo tailscale serve --bg https / http://localhost:8080
+sudo tailscale serve status      # shows the public https URL
 ```
+
+### Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| Pi not in `tailscale status` | `sudo systemctl status tailscaled`, re-run `sudo tailscale up` |
+| Dashboard says "Motor Pi offline" | `ping` the motor Pi's Tailscale IP; confirm the IP saved in the dashboard matches `tailscale ip -4` on the motor Pi |
+| Worked, then stopped after months | Key expiry — disable it (step 4) and re-authenticate |
+| Phone can't connect | Tailscale VPN toggle actually on? Same account? |
 
 ---
 
