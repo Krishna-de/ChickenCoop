@@ -1,14 +1,18 @@
 [Unit]
 Description=Coop Dashboard
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-ExecStart=/usr/bin/python3 -u /home/pi5/ChickenCoop/dashboard.py
-WorkingDirectory=/home/pi5/ChickenCoop
-User=pi5
+# __DIR__ and __USER__ are substituted by install.sh at install time.
+ExecStart=/usr/bin/python3 -u __DIR__/dashboard.py
+WorkingDirectory=__DIR__
+User=__USER__
 Restart=always
 RestartSec=5
-# -u / PYTHONUNBUFFERED: flush print() straight to the journal (no buffering)
+# SIGTERM (the default) lets the app release the cameras cleanly on stop
+TimeoutStopSec=15
+# flush print() straight to the journal (no buffering)
 Environment=PYTHONUNBUFFERED=1
 
 [Install]

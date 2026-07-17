@@ -3,11 +3,14 @@ Description=Coop Motor Server
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/python3 /home/chickenpi/ChickenCoop/motor_server.py
-WorkingDirectory=/home/chickenpi/ChickenCoop
-User=chickenpi
+# __DIR__ and __USER__ are substituted by install.sh at install time.
+ExecStart=/usr/bin/python3 -u __DIR__/motor_server.py
+WorkingDirectory=__DIR__
+User=__USER__
 Restart=always
 RestartSec=5
+# flush print() straight to the journal (no buffering)
+Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=multi-user.target
