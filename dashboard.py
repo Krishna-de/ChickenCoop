@@ -2,14 +2,15 @@
 """ 
 dashboard.py — runs on the CAMERA Pi
 Serves the unified coop dashboard:
-  - RealSense RGB (left) + IR (right) auto-assigned on load
-  - UVC webcam assignable to either slot
+  - Indoor camera (left) + Outside camera (right)
+  - streams stay closed until you press Connect (keeps the Pi cool)
   - motor controls relayed to the motor Pi
 
 Set MOTOR_PI_IP below to your motor Pi Tailscale or LAN IP.
 """
 
 import subprocess, os, re, threading, queue, time, json
+from collections import deque
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from urllib.request import urlopen, Request
@@ -70,30 +71,29 @@ def encode_jpeg(arr, gray, quality=80):
     return None
 
 # ── config ────────────────────────────────────────────────────────────────────
-VERSION     = "1.1.0"
+VERSION     = "1.5.0"
 PORT        = 8080
 FPS         = 10          # ffmpeg/UVC: lower FPS reduces USB bandwidth contention
-REALSENSE_FPS = 15        # SDK serves both streams from one handle — no bandwidth race,
-                          # so use a valid D4xx framerate (6/15/30/60; 10 is NOT valid)
+REALSENSE_FPS = 15        # Indoor camera: must be a valid D4xx framerate
+                          # (6/15/30/60 — 10 is NOT valid)
 MOTOR_PI_IP = "YOUR_MOTOR_PI_IP"
 MOTOR_PORT  = 8081
 
 RES = {
-    "uvc":   (1920, 1080),
-    "intel": (640,  480),
-    "ir":    (640,  480),
+    "uvc":   (1920, 1080),   # Outside camera
+    "intel": (640,  480),    # Indoor camera
 }
 
-# RealSense node map — video0=Depth, video2=IR, video4=RGB
+# Indoor camera colour node (video0=Depth, video2=IR — both unused)
 REALSENSE_RGB_NODE = "/dev/video4"
-REALSENSE_IR_NODE  = "/dev/video2"
-
-# Delay before IR stream opens — gives RGB time to negotiate the device first
-IR_START_DELAY = 2.0
 
 # Keep a UVC ffmpeg stream alive this long after the last viewer leaves, so a
 # page refresh reuses it instead of racing a stop→start re-open (device busy).
 IDLE_GRACE = 5.0
+
+# CPU temperature logging for both Pis (camera + motor), graphed in the dashboard.
+TEMP_SAMPLE_SEC    = 60      # how often to record a sample
+TEMP_HISTORY_HOURS = 24      # how much history to keep / persist
 
 ALLOWED_KEYWORDS = ["uvc", "intel", "realsense", "real sense",
                     "webcam", "usb camera", "usb2.0", "usb3", "general"]
@@ -125,18 +125,13 @@ def list_cameras():
                 for dev in nodes:
                     if dev == REALSENSE_RGB_NODE:
                         cameras.append({"index": int(re.search(r"\d+", dev).group()),
-                                        "device": dev, "name": "RealSense RGB",
-                                        "kind": "intel", "auto": "L"})
-                    elif dev == REALSENSE_IR_NODE:
-                        cameras.append({"index": int(re.search(r"\d+", dev).group()),
-                                        "device": dev, "name": "RealSense IR",
-                                        "kind": "ir", "auto": "R"})
+                                        "device": dev, "name": "Indoor",
+                                        "kind": "intel", "auto": ""})
             else:
                 for dev in nodes:
                     if re.match(r"/dev/video\d+$", dev):
-                        label = name.split("(")[0].strip() or "USB Camera"
                         cameras.append({"index": int(re.search(r"\d+", dev).group()),
-                                        "device": dev, "name": label,
+                                        "device": dev, "name": "Outside",
                                         "kind": "uvc", "auto": ""})
                         break
 
@@ -155,7 +150,7 @@ def list_cameras():
             dev = f"/dev/video{i}"
             if os.path.exists(dev):
                 cameras.append({"index": i, "device": dev,
-                                "name": f"USB Camera {i}", "kind": "uvc", "auto": ""})
+                                "name": f"Outside {i}", "kind": "uvc", "auto": ""})
     return cameras
 
 
@@ -183,6 +178,27 @@ def get_cameras(force=False):
 
 # ── per-camera broadcaster ────────────────────────────────────────────────────
 
+def _kill_proc(p, timeout=2):
+    """Terminate an ffmpeg process and guarantee it dies, freeing the device.
+    A plain terminate()+wait() can hang forever if ffmpeg is blocked on a wedged
+    USB device and ignores SIGTERM — then the node stays busy and no new stream
+    can open it. Escalate to SIGKILL so the device is always released."""
+    if p is None:
+        return
+    try:
+        p.terminate()
+    except Exception:
+        pass
+    try:
+        p.wait(timeout=timeout)
+    except Exception:
+        try:
+            p.kill()
+            p.wait(timeout=timeout)
+        except Exception:
+            pass
+
+
 class CameraStream:
     def __init__(self, device, kind="uvc"):
         self.device  = device
@@ -200,11 +216,7 @@ class CameraStream:
             self.running = False
             t = self.thread
             p = self.proc
-        if p is not None:
-            try:
-                p.terminate()
-            except Exception:
-                pass
+        _kill_proc(p)              # force-free the device (SIGKILL fallback)
         if t and t.is_alive():
             t.join(timeout=4)
 
@@ -242,27 +254,14 @@ class CameraStream:
 
     def _build_cmd(self, w, h):
         """Build the ffmpeg command list for this stream kind."""
-        base = ["ffmpeg", "-f", "v4l2",
+        # Let ffmpeg auto-negotiate the input format.
+        return ["ffmpeg", "-f", "v4l2",
                 "-framerate", str(FPS),
-                "-video_size", f"{w}x{h}"]
-
-        if self.kind == "ir":
-            # IR node exports UYVY alongside GREY — uyvy422 converts cleanly to MJPEG
-            base += ["-input_format", "uyvy422"]
-        elif self.kind == "intel":
-            # RGB node: let ffmpeg auto-negotiate, no format override needed
-            pass
-
-        base += ["-i", self.device,
-                 "-c:v", "mjpeg", "-q:v", "5", "-f", "mjpeg", "pipe:1"]
-        return base
+                "-video_size", f"{w}x{h}",
+                "-i", self.device,
+                "-c:v", "mjpeg", "-q:v", "5", "-f", "mjpeg", "pipe:1"]
 
     def _run(self):
-        # Stagger IR open so RGB gets the USB bus first
-        if self.kind == "ir":
-            print(f"[cam:ir] waiting {IR_START_DELAY}s before opening {self.device}")
-            time.sleep(IR_START_DELAY)
-
         print(f"[cam:{self.kind}] starting {self.device}")
         while self.running:
             w, h   = RES.get(self.kind, (640, 480))
@@ -306,8 +305,7 @@ class CameraStream:
                         else:
                             break
             finally:
-                ffmpeg.terminate()
-                ffmpeg.wait()
+                _kill_proc(ffmpeg)
                 self.proc = None
 
             with self.lock:
@@ -333,17 +331,16 @@ def get_stream(device, kind="uvc"):
 # ── RealSense hub — one pipeline, both streams, one device handle ───────────────
 
 class RealSenseHub:
-    """Drives RGB + IR from a single rs.pipeline.
+    """Drives the Indoor camera's colour stream from a single rs.pipeline.
 
-    Both streams share one USB device context, so there is no concurrent-open
-    race — the bandwidth conflict that the ffmpeg stagger worked around cannot
-    occur here. Frames are JPEG-encoded and fanned out to per-kind client
-    queues, mirroring the CameraStream broadcaster contract.
+    The pipeline only runs while someone is watching — frames are JPEG-encoded
+    and fanned out to client queues, mirroring the CameraStream broadcaster
+    contract. With no viewers the device is released and the Pi stays cool.
     """
 
     def __init__(self):
         self.lock     = threading.Lock()
-        self.clients  = {"intel": [], "ir": []}   # kind -> [queue, ...]
+        self.clients  = {"intel": []}   # kind -> [queue, ...]
         self.running  = False
         self.thread   = None
         self.pipeline = None
@@ -378,10 +375,9 @@ class RealSenseHub:
             if delay > 0:
                 time.sleep(delay)
             with self.lock:
-                has_clients = self.clients["intel"] or self.clients["ir"]
-                if has_clients and not self.running:
+                if self.clients["intel"] and not self.running:
                     self._start()
-                    print(f"[realsense] restarted after {delay}s")
+                    print(f"[indoor] restarted after {delay}s")
         threading.Thread(target=worker, daemon=True).start()
 
     def add_client(self, kind):
@@ -407,29 +403,27 @@ class RealSenseHub:
         pipeline = rs.pipeline()
         config   = rs.config()
         config.enable_stream(rs.stream.color, w, h, rs.format.rgb8, REALSENSE_FPS)
-        config.enable_stream(rs.stream.infrared, 1, w, h, rs.format.y8, REALSENSE_FPS)  # index 1 = left IR
         try:
             pipeline.start(config)
         except Exception as e:
-            print(f"[realsense] pipeline start failed: {e}")
+            print(f"[indoor] pipeline start failed: {e}")
             with self.lock:
                 self.running = False
             return
 
         self.pipeline = pipeline
-        print("[realsense] pipeline started — RGB+IR from one device handle")
+        print("[indoor] pipeline started")
         try:
             while self.running:
                 with self.lock:
-                    if not self.clients["intel"] and not self.clients["ir"]:
+                    if not self.clients["intel"]:
                         break
                 try:
                     frames = pipeline.wait_for_frames(5000)
                 except Exception as e:
-                    print(f"[realsense] wait_for_frames: {e}")
+                    print(f"[indoor] wait_for_frames: {e}")
                     break
                 self._fan("intel", frames.get_color_frame())
-                self._fan("ir",    frames.get_infrared_frame(1))
         finally:
             try:
                 pipeline.stop()
@@ -438,7 +432,7 @@ class RealSenseHub:
             self.pipeline = None
             with self.lock:
                 self.running = False
-            print("[realsense] pipeline stopped")
+            print("[indoor] pipeline stopped")
 
     def _fan(self, kind, frame):
         if not frame:
@@ -448,7 +442,7 @@ class RealSenseHub:
         if not qs:
             return
         img  = np.asanyarray(frame.get_data())
-        data = encode_jpeg(img, gray=(kind == "ir"))
+        data = encode_jpeg(img, gray=False)
         if not data:
             return
         for q in qs:
@@ -462,7 +456,7 @@ realsense_hub = RealSenseHub() if REALSENSE_SDK else None
 
 
 def is_realsense_node(device):
-    return REALSENSE_SDK and device in (REALSENSE_RGB_NODE, REALSENSE_IR_NODE)
+    return REALSENSE_SDK and device == REALSENSE_RGB_NODE
 
 
 # ── motor relay ───────────────────────────────────────────────────────────────
@@ -536,11 +530,14 @@ def motor_post(cmd):
 
 
 def motor_get():
+    """Return (ok, full status dict) — includes state, door_state, top, bottom."""
     try:
         with urlopen(motor_base(), timeout=3) as r:
-            data = json.loads(r.read())
-            return True, data.get("state", "unknown")
+            return True, json.loads(r.read())
     except Exception as e:
+        # Log the real reason — a timeout (Pi busy/network blip) looks very
+        # different from connection-refused (server actually down).
+        print(f"[motor] poll failed: {type(e).__name__}: {e}")
         return False, str(e)
 
 
@@ -551,6 +548,83 @@ def motor_version():
             return json.loads(r.read()).get("version")
     except Exception:
         return None
+
+
+# Recent door commands — in-memory only, deliberately never persisted.
+# Cleared when the dashboard restarts.
+_actions      = deque(maxlen=20)
+_actions_lock = threading.Lock()
+
+
+def log_action(cmd, ok, detail):
+    with _actions_lock:
+        _actions.appendleft({"t": int(time.time()), "cmd": cmd,
+                             "ok": bool(ok), "detail": str(detail)})
+
+
+def motor_temp():
+    """Fetch the motor Pi's CPU temperature (°C) or None."""
+    try:
+        with urlopen(motor_base(), timeout=3) as r:
+            return json.loads(r.read()).get("temp")
+    except Exception:
+        return None
+
+
+# ── temperature logging ─────────────────────────────────────────────────────────
+
+TEMPS_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temps.json")
+_temps      = []                       # [[epoch:int, cam:float|None, motor:float|None], ...]
+_temps_lock = threading.Lock()
+
+
+def read_cpu_temp():
+    """This Pi's CPU temperature in °C, or None."""
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp") as f:
+            return round(int(f.read().strip()) / 1000.0, 1)
+    except Exception:
+        return None
+
+
+def _load_temps():
+    global _temps
+    try:
+        with open(TEMPS_FILE) as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            cutoff = int(time.time()) - TEMP_HISTORY_HOURS * 3600
+            _temps = [s for s in data if isinstance(s, list) and s and s[0] >= cutoff]
+            print(f"[temps] loaded {len(_temps)} samples")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[temps] load failed: {e}")
+
+
+def _save_temps_locked():
+    try:
+        tmp = TEMPS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(_temps, f)
+        os.replace(tmp, TEMPS_FILE)        # atomic, avoids a half-written file
+    except Exception as e:
+        print(f"[temps] save failed: {e}")
+
+
+def _temp_sampler():
+    print(f"[temps] sampling every {TEMP_SAMPLE_SEC}s, keeping {TEMP_HISTORY_HOURS}h")
+    while True:
+        ts  = int(time.time())
+        cam = read_cpu_temp()
+        mot = motor_temp()
+        cutoff = ts - TEMP_HISTORY_HOURS * 3600
+        with _temps_lock:
+            _temps.append([ts, cam, mot])
+            while _temps and _temps[0][0] < cutoff:
+                _temps.pop(0)
+            _save_temps_locked()
+        time.sleep(TEMP_SAMPLE_SEC)
 
 
 # ── HTML ──────────────────────────────────────────────────────────────────────
@@ -600,6 +674,27 @@ header{width:100%;max-width:1100px;display:flex;align-items:center;gap:14px;flex
 .tab-panel{display:none;width:100%;max-width:1100px;flex-direction:column;
   gap:20px;align-items:center}
 .tab-panel.active{display:flex}
+.temp-panel{width:100%;background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--r);padding:18px 20px;display:flex;flex-direction:column;gap:14px}
+.temp-head{display:flex;align-items:center;gap:18px;flex-wrap:wrap}
+.temp-now{font-family:monospace;font-size:.8rem;color:var(--text);display:flex;
+  align-items:center;gap:7px}
+.temp-now b{font-weight:700}
+.temp-now .dot{width:10px;height:10px;border-radius:50%;display:inline-block}
+.dot.cam{background:var(--green)}.dot.mot{background:var(--amber)}
+.temp-range{font-family:monospace;font-size:.66rem;color:var(--muted);margin-left:auto}
+.temp-chart{width:100%;height:320px;background:var(--bg);border:1px solid var(--border);
+  border-radius:8px;overflow:hidden;display:flex;align-items:center;justify-content:center}
+.temp-empty{font-family:monospace;font-size:.78rem;color:var(--muted)}
+.tchart{width:100%;height:100%}
+.tchart .grid{stroke:var(--border);stroke-width:1}
+.tchart .ylab,.tchart .xlab{fill:var(--muted);font-family:monospace;font-size:11px}
+.tchart .xlab{text-anchor:middle}
+.tchart .ylab{text-anchor:end}
+.tchart .lcam{fill:none;stroke:var(--green);stroke-width:2;
+  vector-effect:non-scaling-stroke;stroke-linejoin:round}
+.tchart .lmot{fill:none;stroke:var(--amber);stroke-width:2;
+  vector-effect:non-scaling-stroke;stroke-linejoin:round}
 .cam-grid{display:grid;gap:12px;width:100%;max-width:1100px;
   grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
 .panel{position:relative;background:#000;border:1px solid var(--border);
@@ -673,6 +768,43 @@ header{width:100%;max-width:1100px;display:flex;align-items:center;gap:14px;flex
 .motor-status-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 .motor-title{font-family:monospace;font-size:.72rem;font-weight:700;
   letter-spacing:.1em;text-transform:uppercase;color:var(--muted);flex:1}
+/* door control component */
+.door-panel{width:100%;max-width:1100px;background:var(--surface);
+  border:1px solid var(--border);border-radius:var(--r);padding:18px 22px;
+  display:flex;flex-direction:column;gap:16px}
+.door-head{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.door-title{font-family:monospace;font-size:.72rem;font-weight:700;
+  letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
+.door-badge{font-family:monospace;font-size:.82rem;font-weight:700;letter-spacing:.08em;
+  padding:5px 16px;border-radius:20px;text-transform:uppercase;transition:.2s}
+.db-open   {background:var(--green-dim);color:var(--green);border:1px solid rgba(0,201,125,.4)}
+.db-closed {background:var(--blue-dim);color:var(--blue);border:1px solid rgba(58,143,255,.4)}
+.db-moving {background:var(--amber-dim);color:var(--amber);border:1px solid rgba(255,179,64,.4);
+  animation:pulse 1.4s infinite}
+.db-partial{background:rgba(90,96,112,.15);color:var(--text);border:1px solid var(--border)}
+.db-unknown{background:rgba(90,96,112,.15);color:var(--muted);border:1px solid var(--border)}
+.limits{display:flex;gap:12px;align-items:center}
+.lim{display:flex;align-items:center;gap:6px;font-family:monospace;font-size:.6rem;
+  font-weight:700;letter-spacing:.08em;color:var(--muted)}
+.lim .ldot{width:9px;height:9px;border-radius:50%;background:var(--border);
+  border:1px solid #2e3440;transition:.15s}
+.lim.on{color:var(--green)}
+.lim.on .ldot{background:var(--green);border-color:var(--green);box-shadow:0 0 6px var(--green)}
+.mbtn:disabled{opacity:.35;cursor:not-allowed;filter:grayscale(.5)}
+.acts{display:flex;flex-direction:column;gap:6px}
+.acts-label{font-family:monospace;font-size:.6rem;font-weight:700;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--muted)}
+.acts-label i{font-style:normal;opacity:.6;text-transform:none;letter-spacing:0}
+.acts-list{list-style:none;display:flex;flex-direction:column;gap:2px;
+  max-height:132px;overflow-y:auto}
+.acts-none{font-family:monospace;font-size:.68rem;color:var(--muted);padding:3px 0}
+.act{display:flex;align-items:center;gap:10px;font-family:monospace;font-size:.68rem;
+  padding:3px 8px;border-radius:4px;background:var(--bg)}
+.act .at{color:var(--muted)}
+.act .an{font-weight:700;min-width:74px}
+.act .ad{color:var(--muted);margin-left:auto}
+.act.ok .an{color:var(--text)}
+.act.bad .an,.act.bad .ad{color:var(--red)}
 .state-badge{font-family:monospace;font-size:.72rem;font-weight:700;
   letter-spacing:.1em;padding:4px 12px;border-radius:6px;text-transform:uppercase;transition:.2s}
 .state-stopped{background:rgba(90,96,112,.15);color:var(--muted);border:1px solid var(--border)}
@@ -744,15 +876,16 @@ kbd{background:var(--border);border:1px solid #2e3440;border-radius:4px;
 
 HTML_JS = """
 var CAMS  = CAMS_JSON;
-var slots = {L: null, R: null, C: null};
-var PANEL = {L: 'left', R: 'right', C: 'third'};
-function kindLabel(kind){ return kind === 'ir' ? 'IR' : kind === 'uvc' ? 'UVC' : 'RGB'; }
+var slots = {L: null, R: null};
+var PANEL = {L: 'left', R: 'right'};
+function kindLabel(kind){ return kind === 'uvc' ? 'Outside' : 'Indoor'; }
 
 function showTab(name){
-  ['live', 'door'].forEach(function(t){
+  ['live', 'temps'].forEach(function(t){
     document.getElementById('tab-' + t).classList.toggle('active', t === name);
     document.getElementById('tab-btn-' + t).classList.toggle('active', t === name);
   });
+  if (name === 'temps') loadTemps();
 }
 
 function assign(slot, cam) {
@@ -817,48 +950,90 @@ function restartFeed(device, btn) {
 
 function disconnect(slot, device) {
   var img = document.getElementById('img' + slot);
-  if (img) img.src = '';
+  if (img) img.src = '';          // drops the MJPEG connection -> stream stops
+  showIdle(slot, CAMS.find(function(c){ return c.device === device; }));
+}
+
+// Fixed layout: Indoor -> left, Outside -> right. Nothing streams until the
+// user presses Connect — an idle camera costs no USB bandwidth, CPU or heat.
+function showIdle(slot, cam){
   var panel = document.getElementById('p' + slot);
   panel.className = 'panel';
   var msg = document.createElement('div'); msg.className = 're-msg';
-  var txt = document.createElement('span'); txt.textContent = 'Stream stopped';
-  var btn = document.createElement('button');
-  btn.className = 're-btn ' + slot; btn.textContent = '\\u25B6 Reconnect';
-  btn.onclick = function() {
-    var cam = CAMS.find(function(c){ return c.device === device; });
-    if (cam) assign(slot, cam);
-  };
-  msg.appendChild(txt); msg.appendChild(btn);
+  var txt = document.createElement('span');
+  if (!cam) {
+    txt.textContent = 'Not detected';
+    msg.appendChild(txt);
+  } else {
+    txt.textContent = cam.name;
+    var btn = document.createElement('button');
+    btn.className = 're-btn ' + slot;
+    btn.textContent = '\\u25B6 Connect';
+    btn.onclick = function(){ assign(slot, cam); };
+    msg.appendChild(txt); msg.appendChild(btn);
+  }
   panel.innerHTML = ''; panel.appendChild(msg);
   slots[slot] = null;
 }
+var indoorCam  = CAMS.find(function(c){ return c.kind === 'intel'; });
+var outsideCam = CAMS.find(function(c){ return c.kind === 'uvc'; });
+showIdle('L', indoorCam);
+showIdle('R', outsideCam);
 
-// Deterministic layout by kind: RGB -> Left, IR -> Right, UVC -> Center (third).
-// (The 'auto' field and node order are not trusted here.) Extra UVC cams fall
-// back to any leftover slot, placed only AFTER IR so they can't steal a panel.
-var rgbCam = CAMS.find(function(c){ return c.kind === 'intel'; });
-var irCam  = CAMS.find(function(c){ return c.kind === 'ir'; });
-function fillUVC(){
-  CAMS.forEach(function(cam){
-    if (cam.kind !== 'uvc') return;
-    if (!slots.C) assign('C', cam);          // UVC -> third pane
-    else if (!slots.L) assign('L', cam);
-    else if (!slots.R) assign('R', cam);
-  });
+// door / motor
+// Combine motion (state) with door position (door_state + limit switches) into
+// one label: Opening/Closing while moving, else Open/Closed/Partial.
+var lastStatus  = null;
+var cmdCooldown = false;
+var CMD_COOLDOWN_MS = 1500;   // covers the motor's decel + reverse dwell
+
+// Buttons are disabled by EITHER a limit switch or the anti-spam cooldown,
+// so both inputs must be re-applied together whenever either changes.
+function updateButtons() {
+  var d = lastStatus || {};
+  document.getElementById('btn-up').disabled   = !!d.top || cmdCooldown;
+  document.getElementById('btn-down').disabled = !!d.bottom || cmdCooldown;
+  // Force Stop is never disabled — it's the emergency path.
 }
-if (rgbCam) assign('L', rgbCam);          // RGB always left
-function placeIR(){ if (irCam) assign('R', irCam); fillUVC(); }
-// SDK: instant (IR_DELAY_MS=0). ffmpeg fallback: stagger so RGB opens first.
-if (IR_DELAY_MS > 0) setTimeout(placeIR, IR_DELAY_MS); else placeIR();
-fillUVC();   // place UVC immediately when no RealSense is present
-
-// motor
-function setStateBadge(state) {
-  var el = document.getElementById('state-badge');
-  el.className = 'state-badge state-' + (state || 'stopped');
-  el.textContent = state.charAt(0).toUpperCase() + state.slice(1);
+function renderDoor(d) {
+  lastStatus = d;
+  var badge = document.getElementById('door-badge');
+  var state = d.state, door = d.door_state;
+  var cls = 'unknown', txt = 'Unknown';
+  if (state === 'up')        { cls = 'moving'; txt = 'Opening'; }
+  else if (state === 'down') { cls = 'moving'; txt = 'Closing'; }
+  else if (door === 'open')  { cls = 'open';   txt = 'Open'; }
+  else if (door === 'closed'){ cls = 'closed'; txt = 'Closed'; }
+  else                       { cls = 'partial';txt = 'Partial'; }
+  badge.className = 'door-badge db-' + cls;
+  badge.textContent = txt;
+  document.getElementById('lim-top').classList.toggle('on', !!d.top);
+  document.getElementById('lim-bot').classList.toggle('on', !!d.bottom);
   document.getElementById('btn-up').classList.toggle('active',   state === 'up');
   document.getElementById('btn-down').classList.toggle('active', state === 'down');
+  updateButtons();
+}
+function fmtActTime(sec){
+  var d = new Date(sec * 1000);
+  return ('0'+d.getHours()).slice(-2) + ':' + ('0'+d.getMinutes()).slice(-2)
+       + ':' + ('0'+d.getSeconds()).slice(-2);
+}
+var ACT_NAME = {up: 'Open', down: 'Close', stop: 'Force stop'};
+function loadActions() {
+  fetch('/actions').then(function(r){ return r.json(); }).then(function(d){
+    var ul = document.getElementById('acts-list');
+    var a  = d.actions || [];
+    if (!a.length) { ul.innerHTML = '<li class="acts-none">None yet</li>'; return; }
+    ul.innerHTML = '';
+    a.forEach(function(x){
+      var li = document.createElement('li');
+      li.className = 'act ' + (x.ok ? 'ok' : 'bad');
+      li.innerHTML = '<span class="at">' + fmtActTime(x.t) + '</span>'
+                   + '<span class="an">' + (ACT_NAME[x.cmd] || x.cmd) + '</span>'
+                   + '<span class="ad">' + (x.ok ? x.detail : 'failed') + '</span>';
+      ul.appendChild(li);
+    });
+  }).catch(function(){});
 }
 function setErr(msg) {
   var el  = document.getElementById('motor-err');
@@ -873,20 +1048,41 @@ function setErr(msg) {
   }
 }
 function motorCmd(cmd) {
+  // Anti-spam: Open/Close are rate-limited so rapid clicks can't queue up
+  // reversals. Force Stop always goes through.
+  if (cmd !== 'stop') {
+    if (cmdCooldown) return;
+    cmdCooldown = true; updateButtons();
+    setTimeout(function(){ cmdCooldown = false; updateButtons(); }, CMD_COOLDOWN_MS);
+  }
   fetch('/motor', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({cmd: cmd})})
   .then(function(r){ return r.json(); })
-  .then(function(d){ if (d.ok) { setStateBadge(d.state); setErr(null); } else { setErr(d.error||'error'); } })
-  .catch(function(){ setErr('Network error'); });
+  .then(function(d){ if (d.ok) { setErr(null); pollMotor(); } else { setErr(d.error||'error'); } })
+  .catch(function(){ setErr('Network error'); })
+  .then(function(){ loadActions(); });
+}
+// A single dropped/slow poll (network blip, Pi busy stepping) must not flap the
+// UI to "offline" — only give up after several consecutive misses, and keep
+// showing the last known door state until then.
+var motorFails = 0;
+var MOTOR_FAIL_LIMIT = 3;          // 3 x 4s poll => ~12s before declaring offline
+function motorMissed(msg) {
+  motorFails++;
+  if (motorFails >= MOTOR_FAIL_LIMIT) setErr(msg);
 }
 function pollMotor() {
   fetch('/motor')
   .then(function(r){ return r.json(); })
-  .then(function(d){ if (d.state !== undefined){ setStateBadge(d.state); setErr(null); } else { setErr(d.error||'?'); } })
-  .catch(function(){ setErr('Motor Pi unreachable'); });
+  .then(function(d){
+    if (d.state !== undefined){ motorFails = 0; renderDoor(d); setErr(null); }
+    else { motorMissed(d.error || 'Motor Pi error'); }
+  })
+  .catch(function(){ motorMissed('Motor Pi unreachable'); });
 }
 setInterval(pollMotor, 4000);
 pollMotor();
+loadActions();
 
 // motor Pi IP config
 function loadConfig() {
@@ -920,6 +1116,65 @@ function loadVersions() {
   }).catch(function(){});
 }
 loadVersions();
+
+// ── temperature graph ───────────────────────────────────────────────────────
+function fmtClock(sec){
+  var d = new Date(sec * 1000);
+  return ('0'+d.getHours()).slice(-2) + ':' + ('0'+d.getMinutes()).slice(-2);
+}
+function buildTempSVG(samples){
+  var W = 1000, H = 320, mL = 44, mR = 12, mT = 14, mB = 26;
+  var temps = [];
+  samples.forEach(function(s){ if (s[1]!=null) temps.push(s[1]); if (s[2]!=null) temps.push(s[2]); });
+  if (!temps.length) return null;
+  var lo = Math.min.apply(null, temps), hi = Math.max.apply(null, temps);
+  lo = Math.floor((lo - 3) / 5) * 5; hi = Math.ceil((hi + 3) / 5) * 5;
+  if (hi - lo < 10) hi = lo + 10;
+  var t0 = samples[0][0], t1 = samples[samples.length-1][0];
+  var span = Math.max(1, t1 - t0);
+  function X(t){ return mL + (t - t0) / span * (W - mL - mR); }
+  function Y(v){ return mT + (1 - (v - lo) / (hi - lo)) * (H - mT - mB); }
+  var svg = '<svg viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none" '
+          + 'xmlns="http://www.w3.org/2000/svg" class="tchart">';
+  for (var v = lo; v <= hi; v += 5){
+    var y = Y(v);
+    svg += '<line x1="'+mL+'" y1="'+y+'" x2="'+(W-mR)+'" y2="'+y+'" class="grid"/>';
+    svg += '<text x="'+(mL-6)+'" y="'+(y+3)+'" class="ylab">'+v+'\\u00B0</text>';
+  }
+  [t0, t0+span/2, t1].forEach(function(t){
+    svg += '<text x="'+X(t)+'" y="'+(H-8)+'" class="xlab">'+fmtClock(t)+'</text>';
+  });
+  function line(idx, cls){
+    var pts = '', started = false;
+    samples.forEach(function(s){
+      var v = s[idx];
+      if (v == null){ started = false; return; }
+      pts += (started ? ' L' : 'M') + X(s[0]).toFixed(1) + ' ' + Y(v).toFixed(1);
+      started = true;
+    });
+    return pts ? '<path d="'+pts+'" class="'+cls+'"/>' : '';
+  }
+  svg += line(1, 'lcam') + line(2, 'lmot') + '</svg>';
+  return svg;
+}
+function loadTemps(){
+  fetch('/temps').then(function(r){ return r.json(); }).then(function(d){
+    var box = document.getElementById('temp-chart');
+    var s = d.samples || [];
+    var last = s.length ? s[s.length-1] : null;
+    var cam = last && last[1]!=null ? last[1].toFixed(1)+'\\u00B0C' : '\\u2014';
+    var mot = last && last[2]!=null ? last[2].toFixed(1)+'\\u00B0C' : '\\u2014';
+    document.querySelector('#temp-cam b').textContent = cam;
+    document.querySelector('#temp-mot b').textContent = mot;
+    document.getElementById('temp-range').textContent =
+      s.length ? (s.length + ' samples \\u00B7 last ' + d.hours + 'h') : '';
+    var svg = buildTempSVG(s);
+    box.innerHTML = svg || '<span class="temp-empty">No samples yet\\u2026</span>';
+  }).catch(function(){});
+}
+setInterval(function(){
+  if (document.getElementById('tab-temps').classList.contains('active')) loadTemps();
+}, 30000);
 
 // RealSense pipeline control (only present when SDK active)
 function setPipeBadge(running) {
@@ -975,15 +1230,12 @@ document.addEventListener('keydown', function(e){
 def build_dashboard(cameras):
     cjson   = cam_json(cameras)
     n       = len(cameras)
-    # SDK serves both streams from one handle, so the IR open can be instant;
-    # the ffmpeg fallback still needs the stagger to dodge the USB race.
-    ir_delay = "0" if REALSENSE_SDK else "2500"
-    js       = HTML_JS.replace("CAMS_JSON", cjson).replace("IR_DELAY_MS", ir_delay)
+    js      = HTML_JS.replace("CAMS_JSON", cjson)
 
-    # RealSense pipeline controls only make sense when the SDK drives the device.
+    # Pipeline controls only make sense when the SDK drives the indoor camera.
     pipe_ctrl = (
         '<div class="pipe-ctrl">\n'
-        '  <span class="pipe-title">RealSense pipeline</span>\n'
+        '  <span class="pipe-title">Indoor camera pipeline</span>\n'
         '  <span class="pipe-badge" id="pipe-badge">&hellip;</span>\n'
         '  <button class="pc-btn pc-stop" onclick="stopPipeline()">&#9632; Stop</button>\n'
         '  <span class="pc-delay">restart delay\n'
@@ -1012,33 +1264,35 @@ def build_dashboard(cameras):
         '<nav class="tabs" role="tablist">\n'
         '  <button class="tab active" id="tab-btn-live" onclick="showTab(\'live\')">'
         '&#128247; Live</button>\n'
-        '  <button class="tab" id="tab-btn-door" onclick="showTab(\'door\')">'
-        '&#9881; Door control</button>\n'
+        '  <button class="tab" id="tab-btn-temps" onclick="showTab(\'temps\')">'
+        '&#127777; Temps</button>\n'
         '</nav>\n'
         '<section class="tab-panel active" id="tab-live">\n'
         '<div class="cam-grid">\n'
-        '  <div class="panel" id="pL"><div class="ph"><span>RGB</span>Loading&hellip;</div></div>\n'
-        '  <div class="panel" id="pR"><div class="ph"><span>IR</span>Loading&hellip;</div></div>\n'
-        '  <div class="panel" id="pC"><div class="ph"><span>UVC</span>Loading&hellip;</div></div>\n'
+        '  <div class="panel" id="pL"><div class="ph"><span>Indoor</span>&hellip;</div></div>\n'
+        '  <div class="panel" id="pR"><div class="ph"><span>Outside</span>&hellip;</div></div>\n'
         '</div>\n'
         + pipe_ctrl +
-        '</section>\n'
-        '<section class="tab-panel" id="tab-door">\n'
-        '<div class="motor-panel">\n'
-        '  <div class="motor-status-row">\n'
-        '    <span class="motor-title">NEMA 17 // A4988</span>\n'
-        '    <span class="state-badge state-stopped" id="state-badge">Stopped</span>\n'
+        # ── door control: single inline component ──
+        '<div class="door-panel">\n'
+        '  <div class="door-head">\n'
+        '    <span class="door-title">&#9881; Coop door</span>\n'
+        '    <span class="door-badge db-unknown" id="door-badge">&hellip;</span>\n'
+        '    <span class="limits">\n'
+        '      <span class="lim" id="lim-top"><i class="ldot"></i>TOP</span>\n'
+        '      <span class="lim" id="lim-bot"><i class="ldot"></i>BOTTOM</span>\n'
+        '    </span>\n'
         '    <span class="motor-err" id="motor-err"></span>\n'
         '  </div>\n'
         '  <div class="motor-conn-warn" id="conn-warn">Cannot reach the motor Pi on port '
         + str(MOTOR_PORT) + '. Check the IP below and that motor_server.py is running.</div>\n'
         '  <div class="motor-btns">\n'
         '    <button class="mbtn mbtn-up"   id="btn-up"   onclick="motorCmd(\'up\')">'
-        '<span class="mbtn-icon">&#8593;</span>UP</button>\n'
+        '<span class="mbtn-icon">&#8593;</span>Open</button>\n'
         '    <button class="mbtn mbtn-stop" id="btn-stop" onclick="motorCmd(\'stop\')">'
-        '<span class="mbtn-icon">&#9632;</span>STOP</button>\n'
+        '<span class="mbtn-icon">&#9632;</span>Force Stop</button>\n'
         '    <button class="mbtn mbtn-down" id="btn-down" onclick="motorCmd(\'down\')">'
-        '<span class="mbtn-icon">&#8595;</span>DOWN</button>\n'
+        '<span class="mbtn-icon">&#8595;</span>Close</button>\n'
         '  </div>\n'
         '  <div class="ip-row">\n'
         '    <label class="ip-label" for="ip-input">Motor Pi IP</label>\n'
@@ -1049,12 +1303,29 @@ def build_dashboard(cameras):
         '    <button class="ip-save" onclick="saveMotorIp()">Save</button>\n'
         '    <span class="ip-status" id="ip-status"></span>\n'
         '  </div>\n'
+        '  <div class="acts">\n'
+        '    <span class="acts-label">Recent actions <i>(this session only)</i></span>\n'
+        '    <ul class="acts-list" id="acts-list"><li class="acts-none">None yet</li></ul>\n'
+        '  </div>\n'
         '  <div class="kbd-hint">\n'
-        '    <div class="kh"><kbd>U</kbd> Door up</div>\n'
-        '    <div class="kh"><kbd>D</kbd> Door down</div>\n'
-        '    <div class="kh"><kbd>S</kbd> Stop</div>\n'
+        '    <div class="kh"><kbd>U</kbd> Open</div>\n'
+        '    <div class="kh"><kbd>D</kbd> Close</div>\n'
+        '    <div class="kh"><kbd>S</kbd> Force stop</div>\n'
         '  </div>\n'
         '</div>\n'
+        '</section>\n'
+        '<section class="tab-panel" id="tab-temps">\n'
+        '  <div class="temp-panel">\n'
+        '    <div class="temp-head">\n'
+        '      <span class="temp-now" id="temp-cam"><i class="dot cam"></i>'
+        'Camera Pi <b>&mdash;</b></span>\n'
+        '      <span class="temp-now" id="temp-mot"><i class="dot mot"></i>'
+        'Motor Pi <b>&mdash;</b></span>\n'
+        '      <span class="temp-range" id="temp-range"></span>\n'
+        '    </div>\n'
+        '    <div class="temp-chart" id="temp-chart">'
+        '<span class="temp-empty">No samples yet&hellip;</span></div>\n'
+        '  </div>\n'
         '</section>\n'
         '<script>\n' + js + '\n</script>\n'
         '</body>\n</html>'
@@ -1112,9 +1383,8 @@ class Handler(BaseHTTPRequestHandler):
             peer = self.client_address[0]
 
             if is_realsense_node(device):
-                # Single shared pipeline — no ffmpeg, no two-process race.
-                # kind is derived from the device, so no v4l2-ctl call needed.
-                hk = "intel" if device == REALSENSE_RGB_NODE else "ir"
+                # Indoor camera: SDK pipeline, not ffmpeg.
+                hk = "intel"
                 q  = realsense_hub.add_client(hk)
                 print(f"[feed] +{peer} {device} ({hk}) viewers={len(realsense_hub.clients[hk])}")
                 try:
@@ -1148,7 +1418,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/motor":
             ok, result = motor_get()
             if ok:
-                self._json(200, {"state": result})
+                self._json(200, result)          # full status: state/door_state/top/bottom
             else:
                 self._json(502, {"error": result})
 
@@ -1161,6 +1431,16 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path == "/version":
             self._json(200, {"dashboard": VERSION, "motor": motor_version()})
+
+        elif path == "/actions":
+            with _actions_lock:
+                self._json(200, {"actions": list(_actions)})
+
+        elif path == "/temps":
+            with _temps_lock:
+                samples = list(_temps)
+            self._json(200, {"samples": samples, "interval": TEMP_SAMPLE_SEC,
+                             "hours": TEMP_HISTORY_HOURS})
 
         else:
             self.send_error(404)
@@ -1222,6 +1502,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": f"unknown cmd: {cmd}"})
             return
         ok, result = motor_post(cmd)
+        log_action(cmd, ok, result)
         if ok:
             self._json(200, {"ok": True, "state": result})
         else:
@@ -1245,6 +1526,8 @@ if __name__ == "__main__":
     import signal, atexit
 
     _load_config()
+    _load_temps()
+    threading.Thread(target=_temp_sampler, daemon=True).start()
     cams = get_cameras(force=True)     # warm the cache while the device is idle
     print(f"[dashboard] cameras: {[c['name'] for c in cams] or 'none'}")
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
