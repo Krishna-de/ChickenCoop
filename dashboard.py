@@ -71,7 +71,7 @@ def encode_jpeg(arr, gray, quality=80):
     return None
 
 # ── config ────────────────────────────────────────────────────────────────────
-VERSION     = "1.9.0"
+VERSION     = "1.11.0"
 PORT        = 8080
 FPS         = 10          # ffmpeg/UVC: lower FPS reduces USB bandwidth contention
 REALSENSE_FPS = 15        # Indoor camera. 15 is verified working on this D4xx;
@@ -718,10 +718,11 @@ def _scheduler():
 # shows an unsaved-changes badge.
 
 HENS = [
-    {"id": "grun",   "name": "Miss Grün"},
-    {"id": "koenig", "name": "Miss König"},
-    {"id": "sus",    "name": "Miss Sus"},
+    {"id": "grun",   "name": "Miss Grün",  "color": "#3ddc84"},   # green
+    {"id": "koenig", "name": "Miss König", "color": "#a9744f"},   # brown
+    {"id": "sus",    "name": "Miss Sus",   "color": "#eceff3"},   # white
 ]
+EGGS_SINCE = "2026-07-05"      # the hens started laying on this date
 _HEN_IDS   = {h["id"] for h in HENS}
 _eggs_lock = threading.Lock()
 _DATE_RE   = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -928,13 +929,37 @@ def eggs_load_bytes(data):
     return True, f"restored {n} eggs"
 
 
-def eggs_range(days=14):
-    """Most recent `days` days, newest last, with per-hen booleans."""
+def eggs_stats():
+    """All-time counts since EGGS_SINCE — independent of the view window, so
+    totals stay correct once the grid caps at 30 days."""
+    import datetime
+    with _eggs_lock:
+        rows = _egg_db.execute(
+            "SELECT hen, COUNT(*) FROM eggs WHERE date >= ? GROUP BY hen",
+            (EGGS_SINCE,)).fetchall()
+    per = {h["id"]: 0 for h in HENS}
+    for hen, n in rows:
+        if hen in per:
+            per[hen] = n
+    try:
+        start = datetime.date.fromisoformat(EGGS_SINCE)
+        elapsed = max(1, (datetime.date.today() - start).days + 1)
+    except Exception:
+        elapsed = 1
+    return {"per_hen": per, "total": sum(per.values()), "days": elapsed}
+
+
+def eggs_range(days=30):
+    """Most recent `days` days, newest last, with per-hen booleans.
+    Never reaches back before EGGS_SINCE — days before the hens started laying
+    aren't 'missed' days and would skew the totals."""
     out   = []
     today = time.time()
     with _eggs_lock:
         for i in range(days - 1, -1, -1):
-            d    = time.strftime("%Y-%m-%d", time.localtime(today - i * 86400))
+            d = time.strftime("%Y-%m-%d", time.localtime(today - i * 86400))
+            if d < EGGS_SINCE:
+                continue
             rows = {r[0] for r in
                     _egg_db.execute("SELECT hen FROM eggs WHERE date=?", (d,))}
             out.append({"date": d,
@@ -1164,6 +1189,10 @@ header{width:100%;max-width:1100px;display:flex;align-items:center;gap:14px;flex
   background:var(--green-dim);color:var(--green);border:1px solid rgba(0,201,125,.3)}
 .egg-store.bad{background:var(--amber-dim);color:var(--amber);
   border-color:rgba(255,179,64,.35)}
+.hdot{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:6px;
+  border:1px solid rgba(0,0,0,.35);vertical-align:middle;flex-shrink:0}
+.egg-since{margin-left:8px;padding:2px 7px;border-radius:20px;font-size:.6rem;
+  background:rgba(90,96,112,.18);color:var(--muted);border:1px solid var(--border)}
 .egg-save{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .egg-unsaved{font-family:monospace;font-size:.66rem;color:var(--muted)}
 .egg-unsaved.on{color:var(--amber);font-weight:700}
@@ -1185,11 +1214,18 @@ header{width:100%;max-width:1100px;display:flex;align-items:center;gap:14px;flex
   color:var(--border);background:var(--bg);border-radius:3px;padding:5px 0;cursor:pointer}
 .gc:hover{outline:1px solid var(--green2)}
 .gc.on{color:var(--amber);background:var(--amber-dim)}
-.egg-totals{display:flex;gap:14px;flex-wrap:wrap;font-family:monospace;font-size:.68rem;
-  color:var(--muted);border-top:1px solid var(--border);padding-top:12px}
-.egg-tot b{color:var(--text);font-weight:700}
-.egg-tot.all{margin-left:auto}
-.egg-tot.all b{color:var(--amber)}
+.egg-totals{display:grid;gap:10px;border-top:1px solid var(--border);padding-top:14px;
+  grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
+.stat{background:var(--bg);border:1px solid var(--border);border-radius:var(--r);
+  padding:12px 14px;display:flex;flex-direction:column;gap:3px}
+.stat .sname{font-family:monospace;font-size:.68rem;font-weight:700;
+  display:flex;align-items:center}
+.stat .snum{font-size:1.8rem;font-weight:700;line-height:1.1;font-family:monospace}
+.stat .ssub{font-family:monospace;font-size:.6rem;color:var(--muted)}
+.stat .ssub b{color:var(--text)}
+.stat.total{border-color:rgba(255,179,64,.45);background:var(--amber-dim)}
+.stat.total .snum{color:var(--amber)}
+.stat.total .sname{color:var(--amber)}
 .acts{display:flex;flex-direction:column;gap:6px}
 .acts-label{font-family:monospace;font-size:.6rem;font-weight:700;letter-spacing:.1em;
   text-transform:uppercase;color:var(--muted)}
@@ -1540,7 +1576,12 @@ function saveSchedule() {
 loadSchedule();
 
 // ── egg log ─────────────────────────────────────────────────────────────────
-var EGG_DAYS = 14;
+var EGG_DAYS = 30;
+// hex -> rgba, so each hen's colour can tint its own controls
+function tint(hex, a) {
+  var n = parseInt(hex.slice(1), 16);
+  return 'rgba(' + ((n>>16)&255) + ',' + ((n>>8)&255) + ',' + (n&255) + ',' + a + ')';
+}
 function toggleEgg(date, hen, laid) {
   fetch('/eggs', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({date: date, hen: hen, laid: laid})})
@@ -1554,7 +1595,8 @@ function loadEggs() {
               : (d.online === false ? '\\u26A0 ' + d.store + ' unreachable'
                                     : '\\u2713 ' + d.store);
     document.getElementById('egg-today').innerHTML =
-      today + ' <span class="egg-store' + (d.online === false ? ' bad' : '')
+      today + (d.since ? ' <span class="egg-since">laying since ' + d.since + '</span>' : '')
+            + ' <span class="egg-store' + (d.online === false ? ' bad' : '')
             + '">' + store + '</span>';
     var u = document.getElementById('egg-unsaved');
     if (d.unsaved) {
@@ -1574,8 +1616,13 @@ function loadEggs() {
       var on = !!(last.hens && last.hens[h.id]);
       var b  = document.createElement('button');
       b.className = 'egg-btn' + (on ? ' on' : '');
+      b.style.borderColor = on ? h.color : '';
+      b.style.background  = on ? tint(h.color, .16) : '';
+      b.style.color       = on ? h.color : '';
       b.innerHTML = '<span class="ei">' + (on ? '\\uD83E\\uDD5A' : '\\u2014')
-                  + '</span><span class="en">' + h.name + '</span>';
+                  + '</span><span class="en">'
+                  + '<i class="hdot" style="background:' + h.color + '"></i>'
+                  + h.name + '</span>';
       b.onclick = function(){ toggleEgg(today, h.id, !on); };
       tg.appendChild(b);
     });
@@ -1589,32 +1636,46 @@ function loadEggs() {
       g.appendChild(cell(x.date.slice(8) + '/' + x.date.slice(5,7), 'gh'));
     });
     hens.forEach(function(h){
-      g.appendChild(cell(h.name, 'gn'));
+      var nm = cell('', 'gn');
+      nm.innerHTML = '<i class="hdot" style="background:' + h.color + '"></i>' + h.name;
+      g.appendChild(nm);
       days.forEach(function(x){
         var on = !!x.hens[h.id];
         var c  = cell(on ? '\\u25CF' : '\\u00B7', 'gc' + (on ? ' on' : ''));
+        if (on) { c.style.color = h.color; c.style.background = tint(h.color, .15); }
         c.title = h.name + ' \\u2014 ' + x.date + (on ? ': egg' : ': none');
         c.onclick = function(){ toggleEgg(x.date, h.id, !on); };
         g.appendChild(c);
       });
     });
 
-    // totals
+    // status cards: eggs collected per hen + overall
+    var st  = d.stats || {per_hen:{}, total:0, days:1};
     var tot = document.getElementById('egg-totals');
     tot.innerHTML = '';
     hens.forEach(function(h){
-      var n = days.filter(function(x){ return x.hens[h.id]; }).length;
-      var s = document.createElement('span');
-      s.className = 'egg-tot';
-      s.innerHTML = '<b>' + h.name + '</b> ' + n + '/' + days.length + ' days';
-      tot.appendChild(s);
+      var n    = st.per_hen[h.id] || 0;
+      var rate = Math.round(n / st.days * 100);
+      var week = days.slice(-7).filter(function(x){ return x.hens[h.id]; }).length;
+      var c = document.createElement('div');
+      c.className = 'stat';
+      c.style.borderColor = tint(h.color, .45);
+      c.innerHTML =
+        '<div class="sname"><i class="hdot" style="background:' + h.color + '"></i>'
+        + '<span style="color:' + h.color + '">' + h.name + '</span></div>'
+        + '<div class="snum" style="color:' + h.color + '">' + n + '</div>'
+        + '<div class="ssub">eggs \\u00B7 ' + rate + '% of ' + st.days + ' days</div>'
+        + '<div class="ssub">last 7 days: <b>' + week + '</b></div>';
+      tot.appendChild(c);
     });
-    var all = days.reduce(function(a,x){
-      return a + hens.filter(function(h){ return x.hens[h.id]; }).length; }, 0);
-    var s2 = document.createElement('span');
-    s2.className = 'egg-tot all';
-    s2.innerHTML = '<b>Total</b> ' + all + ' eggs / ' + days.length + ' days';
-    tot.appendChild(s2);
+    var avg = (st.total / st.days).toFixed(1);
+    var c2  = document.createElement('div');
+    c2.className = 'stat total';
+    c2.innerHTML = '<div class="sname">\\uD83E\\uDD5A Total collected</div>'
+                 + '<div class="snum">' + st.total + '</div>'
+                 + '<div class="ssub">since ' + (d.since || '') + '</div>'
+                 + '<div class="ssub">avg <b>' + avg + '</b> eggs/day</div>';
+    tot.appendChild(c2);
   }).catch(function(){});
 }
 function cell(txt, cls) {
@@ -2049,12 +2110,14 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path == "/eggs":
             try:
-                days = max(1, min(int(self.parse_qs().get("days", 14)), 90))
+                days = max(1, min(int(self.parse_qs().get("days", 30)), 365))
             except ValueError:
-                days = 14
+                days = 30
             url, _ = get_egg_db()
             self._json(200, {"hens": HENS, "days": eggs_range(days),
                              "today": time.strftime("%Y-%m-%d"),
+                             "since": EGGS_SINCE,
+                             "stats": eggs_stats(),
                              "store": url or "",
                              "online": _egg_online,
                              "unsaved": _egg_dirty,
