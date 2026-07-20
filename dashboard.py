@@ -74,13 +74,17 @@ def encode_jpeg(arr, gray, quality=80):
 VERSION     = "1.5.0"
 PORT        = 8080
 FPS         = 10          # ffmpeg/UVC: lower FPS reduces USB bandwidth contention
-REALSENSE_FPS = 15        # Indoor camera: must be a valid D4xx framerate
-                          # (6/15/30/60 — 10 is NOT valid)
+REALSENSE_FPS = 6         # Indoor camera: valid D4xx rates are 6/15/30/60.
+                          # Every frame is JPEG-encoded in Python, so this is
+                          # the main CPU/heat knob — 6fps is plenty for a coop.
+JPEG_QUALITY  = 70        # Indoor encode quality (lower = less CPU + bandwidth)
+MJPEG_QSCALE  = 7         # ffmpeg -q:v when a UVC cam can't do MJPEG passthrough
+                          # (2=best/heaviest, 31=worst/lightest)
 MOTOR_PI_IP = "YOUR_MOTOR_PI_IP"
 MOTOR_PORT  = 8081
 
 RES = {
-    "uvc":   (1920, 1080),   # Outside camera
+    "uvc":   (1280, 720),    # Outside camera (1080p costs USB bandwidth for little gain)
     "intel": (640,  480),    # Indoor camera
 }
 
@@ -92,7 +96,8 @@ REALSENSE_RGB_NODE = "/dev/video4"
 IDLE_GRACE = 5.0
 
 # CPU temperature logging for both Pis (camera + motor), graphed in the dashboard.
-TEMP_SAMPLE_SEC    = 60      # how often to record a sample
+TEMP_SAMPLE_SEC    = 60      # how often to record a sample (kept in RAM)
+TEMP_FLUSH_SEC     = 900     # how often those samples hit the SD card (15 min)
 TEMP_HISTORY_HOURS = 24      # how much history to keep / persist
 
 ALLOWED_KEYWORDS = ["uvc", "intel", "realsense", "real sense",
@@ -208,6 +213,10 @@ class CameraStream:
         self.running = False
         self.thread  = None
         self.proc    = None      # the live ffmpeg subprocess, for external stop
+        # Most UVC webcams emit MJPEG natively, so we can copy frames instead of
+        # decode+re-encode — that transcode is the single biggest CPU/heat cost.
+        # Falls back to transcoding automatically if the camera can't do MJPEG.
+        self.passthrough = (kind == "uvc")
 
     def stop(self):
         """Stop streaming and kill the ffmpeg child. Without this an abrupt
@@ -254,12 +263,18 @@ class CameraStream:
 
     def _build_cmd(self, w, h):
         """Build the ffmpeg command list for this stream kind."""
-        # Let ffmpeg auto-negotiate the input format.
-        return ["ffmpeg", "-f", "v4l2",
+        base = ["ffmpeg", "-loglevel", "error", "-f", "v4l2",
                 "-framerate", str(FPS),
-                "-video_size", f"{w}x{h}",
-                "-i", self.device,
-                "-c:v", "mjpeg", "-q:v", "5", "-f", "mjpeg", "pipe:1"]
+                "-video_size", f"{w}x{h}"]
+        if self.passthrough:
+            # Ask the camera for MJPEG and copy it straight through: no decode,
+            # no encode, near-zero CPU.
+            return base + ["-input_format", "mjpeg", "-i", self.device,
+                           "-c:v", "copy", "-f", "mjpeg", "pipe:1"]
+        # Fallback: camera can't do MJPEG, so we must transcode (expensive).
+        return base + ["-i", self.device,
+                       "-c:v", "mjpeg", "-q:v", str(MJPEG_QSCALE),
+                       "-f", "mjpeg", "pipe:1"]
 
     def _run(self):
         print(f"[cam:{self.kind}] starting {self.device}")
@@ -271,6 +286,7 @@ class CameraStream:
                                       stderr=subprocess.DEVNULL)
             self.proc = ffmpeg
             buf = b""
+            frames_seen = 0
             idle_since = None          # when clients last dropped to zero
             try:
                 while self.running:
@@ -296,6 +312,7 @@ class CameraStream:
                         if s != -1 and e != -1 and e > s:
                             frame = buf[s:e+2]
                             buf   = buf[e+2:]
+                            frames_seen += 1
                             with self.lock:
                                 for q in list(self.clients):
                                     try:
@@ -307,6 +324,13 @@ class CameraStream:
             finally:
                 _kill_proc(ffmpeg)
                 self.proc = None
+
+            # If MJPEG passthrough yielded nothing, this camera can't do MJPEG —
+            # drop to transcoding for subsequent attempts.
+            if self.passthrough and frames_seen == 0:
+                self.passthrough = False
+                print(f"[cam:{self.kind}] {self.device}: no MJPEG from camera, "
+                      "falling back to transcode (higher CPU)")
 
             with self.lock:
                 if not self.clients:
@@ -442,7 +466,7 @@ class RealSenseHub:
         if not qs:
             return
         img  = np.asanyarray(frame.get_data())
-        data = encode_jpeg(img, gray=False)
+        data = encode_jpeg(img, gray=False, quality=JPEG_QUALITY)
         if not data:
             return
         for q in qs:
@@ -576,6 +600,7 @@ def motor_temp():
 TEMPS_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temps.json")
 _temps      = []                       # [[epoch:int, cam:float|None, motor:float|None], ...]
 _temps_lock = threading.Lock()
+_last_flush = 0.0                      # last time samples were written to disk
 
 
 def read_cpu_temp():
@@ -612,8 +637,18 @@ def _save_temps_locked():
         print(f"[temps] save failed: {e}")
 
 
+def flush_temps():
+    """Persist the in-memory samples. Called on the flush interval and on exit."""
+    global _last_flush
+    with _temps_lock:
+        _save_temps_locked()
+        _last_flush = time.time()
+
+
 def _temp_sampler():
-    print(f"[temps] sampling every {TEMP_SAMPLE_SEC}s, keeping {TEMP_HISTORY_HOURS}h")
+    global _last_flush
+    print(f"[temps] sampling every {TEMP_SAMPLE_SEC}s, "
+          f"flushing to disk every {TEMP_FLUSH_SEC}s, keeping {TEMP_HISTORY_HOURS}h")
     while True:
         ts  = int(time.time())
         cam = read_cpu_temp()
@@ -623,7 +658,11 @@ def _temp_sampler():
             _temps.append([ts, cam, mot])
             while _temps and _temps[0][0] < cutoff:
                 _temps.pop(0)
-            _save_temps_locked()
+            # Samples live in RAM; only touch the SD card every TEMP_FLUSH_SEC.
+            # Writing once per sample burned ~1440 full-file rewrites a day.
+            if ts - _last_flush >= TEMP_FLUSH_SEC:
+                _save_temps_locked()
+                _last_flush = ts
         time.sleep(TEMP_SAMPLE_SEC)
 
 
@@ -1520,6 +1559,7 @@ def _cleanup():
     for s in streams:
         print(f"[dashboard] stopping ffmpeg for {s.device}...")
         s.stop()
+    flush_temps()      # write buffered samples so a clean stop loses nothing
 
 
 if __name__ == "__main__":
