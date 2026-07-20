@@ -9,7 +9,7 @@ Serves the unified coop dashboard:
 Set MOTOR_PI_IP below to your motor Pi Tailscale or LAN IP.
 """
 
-import subprocess, os, re, threading, queue, time, json
+import subprocess, os, re, threading, queue, time, json, sqlite3
 from collections import deque
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
@@ -71,12 +71,13 @@ def encode_jpeg(arr, gray, quality=80):
     return None
 
 # ── config ────────────────────────────────────────────────────────────────────
-VERSION     = "1.5.0"
+VERSION     = "1.9.0"
 PORT        = 8080
 FPS         = 10          # ffmpeg/UVC: lower FPS reduces USB bandwidth contention
-REALSENSE_FPS = 6         # Indoor camera: valid D4xx rates are 6/15/30/60.
-                          # Every frame is JPEG-encoded in Python, so this is
-                          # the main CPU/heat knob — 6fps is plenty for a coop.
+REALSENSE_FPS = 15        # Indoor camera. 15 is verified working on this D4xx;
+                          # 10 is NOT a valid rate. Every frame is JPEG-encoded
+                          # in Python, so this is the main CPU/heat knob — try 6
+                          # to cut load (falls back automatically if rejected).
 JPEG_QUALITY  = 70        # Indoor encode quality (lower = less CPU + bandwidth)
 MJPEG_QSCALE  = 7         # ffmpeg -q:v when a UVC cam can't do MJPEG passthrough
                           # (2=best/heaviest, 31=worst/lightest)
@@ -96,9 +97,8 @@ REALSENSE_RGB_NODE = "/dev/video4"
 IDLE_GRACE = 5.0
 
 # CPU temperature logging for both Pis (camera + motor), graphed in the dashboard.
-TEMP_SAMPLE_SEC    = 60      # how often to record a sample (kept in RAM)
-TEMP_FLUSH_SEC     = 900     # how often those samples hit the SD card (15 min)
-TEMP_HISTORY_HOURS = 24      # how much history to keep / persist
+TEMP_SAMPLE_SEC    = 60      # how often to record a sample (RAM only, no disk)
+TEMP_HISTORY_HOURS = 24      # rolling window kept in memory
 
 ALLOWED_KEYWORDS = ["uvc", "intel", "realsense", "real sense",
                     "webcam", "usb camera", "usb2.0", "usb3", "general"]
@@ -423,14 +423,26 @@ class RealSenseHub:
         self.thread.start()
 
     def _run(self):
-        w, h     = RES["intel"]
-        pipeline = rs.pipeline()
-        config   = rs.config()
-        config.enable_stream(rs.stream.color, w, h, rs.format.rgb8, REALSENSE_FPS)
-        try:
-            pipeline.start(config)
-        except Exception as e:
-            print(f"[indoor] pipeline start failed: {e}")
+        w, h = RES["intel"]
+        # Not every D4xx advertises every rate for the colour profile, so try the
+        # configured FPS first and fall back to other valid rates rather than
+        # failing outright with "Couldn't resolve requests".
+        candidates = [REALSENSE_FPS] + [f for f in (15, 30, 6) if f != REALSENSE_FPS]
+        pipeline = None
+        for fps in candidates:
+            p   = rs.pipeline()
+            cfg = rs.config()
+            cfg.enable_stream(rs.stream.color, w, h, rs.format.rgb8, fps)
+            try:
+                p.start(cfg)
+                pipeline = p
+                if fps != REALSENSE_FPS:
+                    print(f"[indoor] {REALSENSE_FPS}fps unsupported, using {fps}fps")
+                break
+            except Exception as e:
+                print(f"[indoor] {fps}fps rejected: {e}")
+        if pipeline is None:
+            print("[indoor] pipeline start failed at every rate")
             with self.lock:
                 self.running = False
             return
@@ -490,32 +502,93 @@ def is_realsense_node(device):
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "dashboard_config.json")
 
-_motor_ip   = MOTOR_PI_IP
+# Whole config lives in one dict so saving one setting can't clobber another.
+_config = {
+    "motor_pi_ip": MOTOR_PI_IP,
+    # Remote egg store, e.g. "http://192.168.1.50:8090" (egg_collector.py).
+    # Empty = keep eggs in a local file on the Pi.
+    "egg_db_url":  "",
+    "egg_db_token": "",
+    "schedule": {
+        "open_enabled":  True,
+        "open_time":     "07:00",
+        "close_enabled": False,
+        "close_time":    "21:00",
+    },
+}
 _config_lock = threading.Lock()
 
 # Accept dotted IPv4 or a hostname/Tailscale name; reject anything with chars
 # that could smuggle a port, path, or scheme into the URL.
-_IP_RE = re.compile(r"^[A-Za-z0-9.\-]{1,253}$")
+_IP_RE   = re.compile(r"^[A-Za-z0-9.\-]{1,253}$")
+_TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")     # 24h HH:MM
+
+
+def _save_config_locked():
+    """Write the whole config atomically. Caller holds _config_lock."""
+    tmp = CONFIG_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(_config, f, indent=2)
+    os.replace(tmp, CONFIG_FILE)
 
 
 def _load_config():
-    global _motor_ip
     try:
         with open(CONFIG_FILE) as f:
             data = json.load(f)
+    except FileNotFoundError:
+        return
+    except Exception as e:
+        print(f"[config] load failed ({e}); using defaults")
+        return
+    with _config_lock:
         ip = data.get("motor_pi_ip")
         if ip and _IP_RE.match(ip):
-            _motor_ip = ip
-            print(f"[config] loaded motor Pi IP: {_motor_ip}")
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        print(f"[config] load failed ({e}); using default {_motor_ip}")
+            _config["motor_pi_ip"] = ip
+        for k in ("egg_db_url", "egg_db_token"):
+            if isinstance(data.get(k), str):
+                _config[k] = data[k].strip()
+        sch = data.get("schedule")
+        if isinstance(sch, dict):
+            for k in ("open_enabled", "close_enabled"):
+                if k in sch:
+                    _config["schedule"][k] = bool(sch[k])
+            for k in ("open_time", "close_time"):
+                if _TIME_RE.match(str(sch.get(k, ""))):
+                    _config["schedule"][k] = sch[k]
+    print(f"[config] motor Pi IP {_config['motor_pi_ip']}, "
+          f"schedule {_config['schedule']}")
 
 
 def get_motor_ip():
     with _config_lock:
-        return _motor_ip
+        return _config["motor_pi_ip"]
+
+
+def get_schedule():
+    with _config_lock:
+        return dict(_config["schedule"])
+
+
+def get_egg_db():
+    with _config_lock:
+        return _config["egg_db_url"], _config["egg_db_token"]
+
+
+def set_egg_db(url, token):
+    """Point the egg log at a remote collector ('' = store locally)."""
+    url = (url or "").strip().rstrip("/")
+    if url and not re.match(r"^https?://[A-Za-z0-9.\-]+(:\d+)?$", url):
+        return False, "URL must look like http://host:port"
+    with _config_lock:
+        _config["egg_db_url"]   = url
+        _config["egg_db_token"] = (token or "").strip()
+        try:
+            _save_config_locked()
+        except Exception as e:
+            return False, f"saved in memory but write failed: {e}"
+    print(f"[eggs] store = {url or 'local file'}")
+    return True, url
 
 
 def set_motor_ip(ip):
@@ -523,16 +596,37 @@ def set_motor_ip(ip):
     ip = (ip or "").strip()
     if not _IP_RE.match(ip):
         return False, "invalid IP or hostname"
-    global _motor_ip
     with _config_lock:
-        _motor_ip = ip
+        _config["motor_pi_ip"] = ip
         try:
-            with open(CONFIG_FILE, "w") as f:
-                json.dump({"motor_pi_ip": ip}, f)
+            _save_config_locked()
         except Exception as e:
             return False, f"saved in memory but write failed: {e}"
     print(f"[config] motor Pi IP set to {ip}")
     return True, ip
+
+
+def set_schedule(data):
+    """Validate and persist the door schedule. Returns (ok, schedule|error)."""
+    if not isinstance(data, dict):
+        return False, "bad payload"
+    for k in ("open_time", "close_time"):
+        if k in data and not _TIME_RE.match(str(data[k])):
+            return False, f"{k} must be HH:MM (24h)"
+    with _config_lock:
+        for k in ("open_enabled", "close_enabled"):
+            if k in data:
+                _config["schedule"][k] = bool(data[k])
+        for k in ("open_time", "close_time"):
+            if k in data:
+                _config["schedule"][k] = data[k]
+        try:
+            _save_config_locked()
+        except Exception as e:
+            return False, f"saved in memory but write failed: {e}"
+        sch = dict(_config["schedule"])
+    print(f"[config] schedule set to {sch}")
+    return True, sch
 
 
 def motor_base():
@@ -586,6 +680,268 @@ def log_action(cmd, ok, detail):
                              "ok": bool(ok), "detail": str(detail)})
 
 
+# ── door schedule ─────────────────────────────────────────────────────────────
+# Fires the configured open/close commands once per day. Runs on the camera Pi
+# because that's where the config and UI live — note the door will NOT move on
+# schedule if this Pi is down (the motor Pi has no clock-driven logic).
+_sched_fired = {}      # "open"/"close" -> "YYYY-MM-DD" it last fired
+
+
+def _scheduler():
+    print("[sched] scheduler started")
+    while True:
+        try:
+            sch   = get_schedule()
+            now   = time.localtime()
+            today = time.strftime("%Y-%m-%d", now)
+            hhmm  = time.strftime("%H:%M", now)
+            for action, cmd in (("open", "up"), ("close", "down")):
+                if not sch.get(action + "_enabled"):
+                    continue
+                if sch.get(action + "_time") != hhmm:
+                    continue
+                if _sched_fired.get(action) == today:
+                    continue                      # already ran today
+                _sched_fired[action] = today
+                ok, res = motor_post(cmd)
+                log_action("schedule:" + action, ok, res)
+                print(f"[sched] {action} fired at {hhmm} -> ok={ok} {res}")
+        except Exception as e:
+            print(f"[sched] error: {e}")
+        time.sleep(20)          # 20s tick: never misses an HH:MM window
+
+
+# ── egg log ───────────────────────────────────────────────────────────────────
+# Lives in an in-memory SQLite database — nothing is ever written to the SD card.
+# Pulled from the laptop's collector at startup; pushed back only when you press
+# "Save to laptop". Unsaved taps are lost if the dashboard restarts, so the UI
+# shows an unsaved-changes badge.
+
+HENS = [
+    {"id": "grun",   "name": "Miss Grün"},
+    {"id": "koenig", "name": "Miss König"},
+    {"id": "sus",    "name": "Miss Sus"},
+]
+_HEN_IDS   = {h["id"] for h in HENS}
+_eggs_lock = threading.Lock()
+_DATE_RE   = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+_egg_db     = sqlite3.connect(":memory:", check_same_thread=False)
+_egg_dirty  = 0                # unsaved changes since the last successful save
+_egg_saved  = None             # epoch of last successful save
+_egg_online = None             # last known reachability of the collector
+
+with _eggs_lock:
+    _egg_db.execute("""CREATE TABLE IF NOT EXISTS eggs (
+                           date TEXT NOT NULL,
+                           hen  TEXT NOT NULL,
+                           PRIMARY KEY (date, hen))""")
+
+
+def _egg_req(path, payload=None, timeout=8):
+    """Call the remote collector. Returns parsed JSON, raises on failure."""
+    url, token = get_egg_db()
+    if not url:
+        raise RuntimeError("no egg database configured")
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["X-Token"] = token
+    body = json.dumps(payload).encode() if payload is not None else None
+    req  = Request(url + path, data=body, headers=headers,
+                   method="POST" if payload is not None else "GET")
+    with urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def _eggs_snapshot():
+    """Whole in-memory DB as {date: {hen: True}} — the payload we push."""
+    out = {}
+    with _eggs_lock:
+        for date, hen in _egg_db.execute("SELECT date, hen FROM eggs"):
+            out.setdefault(date, {})[hen] = True
+    return out
+
+
+def _load_eggs():
+    """Seed the in-memory DB from the laptop's collector."""
+    global _egg_online, _egg_dirty
+    url, _ = get_egg_db()
+    if not url:
+        print("[eggs] no egg database configured — memory only")
+        return
+    try:
+        data = _egg_req("/eggs").get("eggs", {})
+        with _eggs_lock:
+            _egg_db.execute("DELETE FROM eggs")
+            for d, hens in data.items():
+                if not _DATE_RE.match(d) or not isinstance(hens, dict):
+                    continue
+                for hen, laid in hens.items():
+                    if laid and hen in _HEN_IDS:
+                        _egg_db.execute("INSERT OR IGNORE INTO eggs VALUES(?,?)", (d, hen))
+            n = _egg_db.execute("SELECT COUNT(DISTINCT date) FROM eggs").fetchone()[0]
+        _egg_dirty  = 0
+        _egg_online = True
+        print(f"[eggs] loaded {n} days from {url}")
+    except Exception as e:
+        _egg_online = False
+        print(f"[eggs] could not load from {url}: {e}")
+
+
+def set_egg(date, hen, laid):
+    """Record a hen laying, in memory only. Returns (ok, error)."""
+    global _egg_dirty
+    if not _DATE_RE.match(str(date)):
+        return False, "date must be YYYY-MM-DD"
+    if hen not in _HEN_IDS:
+        return False, f"unknown hen: {hen}"
+    with _eggs_lock:
+        if laid:
+            _egg_db.execute("INSERT OR IGNORE INTO eggs VALUES(?,?)", (date, hen))
+        else:
+            _egg_db.execute("DELETE FROM eggs WHERE date=? AND hen=?", (date, hen))
+    _egg_dirty += 1
+    return True, None
+
+
+def save_eggs():
+    """Push the whole in-memory DB to the laptop. Returns (ok, msg)."""
+    global _egg_dirty, _egg_saved, _egg_online
+    url, _ = get_egg_db()
+    if not url:
+        return False, "no egg database configured"
+    snap = _eggs_snapshot()
+    try:
+        res = _egg_req("/eggs/bulk", {"eggs": snap}, timeout=20)
+    except Exception as e:
+        _egg_online = False
+        return False, str(e)
+    _egg_dirty  = 0
+    _egg_saved  = time.time()
+    _egg_online = True
+    msg = f"{res.get('days', len(snap))} days, {res.get('rows', 0)} eggs"
+    print(f"[eggs] saved to {url}: {msg}")
+    return True, msg
+
+
+def _ram_tmp(name):
+    """A scratch path in RAM (/dev/shm) so nothing touches the SD card."""
+    import tempfile
+    d = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
+    return os.path.join(d, f"{name}-{os.getpid()}-{int(time.time()*1000)}.db")
+
+
+def eggs_db_bytes():
+    """The in-memory database as a real .db file, built entirely in RAM."""
+    with _eggs_lock:
+        try:
+            return _egg_db.serialize()          # Python 3.11+
+        except AttributeError:
+            pass
+        path = _ram_tmp("eggs-dl")
+        dest = sqlite3.connect(path)
+        try:
+            _egg_db.backup(dest)
+            dest.close()
+            with open(path, "rb") as f:
+                return f.read()
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+def mark_eggs_downloaded():
+    """The log has been exported off the Pi, so it's no longer 'unsaved'."""
+    global _egg_dirty, _egg_saved
+    _egg_dirty = 0
+    _egg_saved = time.time()
+
+
+def eggs_csv():
+    names = {h["id"]: h["name"] for h in HENS}
+    out = ["date,hen_id,hen_name"]
+    with _eggs_lock:
+        for date, hen in _egg_db.execute(
+                "SELECT date, hen FROM eggs ORDER BY date, hen"):
+            out.append(f'{date},{hen},"{names.get(hen, hen)}"')
+    return "\n".join(out) + "\n"
+
+
+def _rows_from_db_bytes(data):
+    """Read (date, hen) rows out of a .db file's bytes."""
+    try:                                    # Python 3.11+: straight from RAM
+        con = sqlite3.connect(":memory:")
+        con.deserialize(data)
+        rows = con.execute("SELECT date, hen FROM eggs").fetchall()
+        con.close()
+        return rows
+    except AttributeError:
+        pass
+    path = _ram_tmp("eggs-up")              # older Python: via a RAM-backed file
+    try:
+        with open(path, "wb") as f:
+            f.write(data)
+        src  = sqlite3.connect(path)
+        rows = src.execute("SELECT date, hen FROM eggs").fetchall()
+        src.close()
+        return rows
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _rows_from_csv(text):
+    """Read (date, hen) rows out of our CSV export."""
+    rows = []
+    for line in text.splitlines():
+        parts = [p.strip().strip('"') for p in line.split(",")]
+        if len(parts) >= 2 and _DATE_RE.match(parts[0]):
+            rows.append((parts[0], parts[1]))
+    return rows
+
+
+def eggs_load_bytes(data):
+    """Restore from an uploaded .db or .csv export. Returns (ok, msg)."""
+    global _egg_dirty
+    try:
+        if data[:15] == b"SQLite format 3":
+            rows = _rows_from_db_bytes(data)
+        else:
+            rows = _rows_from_csv(data.decode("utf-8", "replace"))
+            if not rows:
+                return False, "no egg rows found in file"
+    except Exception as e:
+        return False, f"could not read file: {e}"
+    n = 0
+    with _eggs_lock:
+        _egg_db.execute("DELETE FROM eggs")
+        for date, hen in rows:
+            if _DATE_RE.match(str(date)) and hen in _HEN_IDS:
+                _egg_db.execute("INSERT OR IGNORE INTO eggs VALUES(?,?)", (date, hen))
+                n += 1
+    _egg_dirty = 0
+    print(f"[eggs] restored {n} eggs from upload")
+    return True, f"restored {n} eggs"
+
+
+def eggs_range(days=14):
+    """Most recent `days` days, newest last, with per-hen booleans."""
+    out   = []
+    today = time.time()
+    with _eggs_lock:
+        for i in range(days - 1, -1, -1):
+            d    = time.strftime("%Y-%m-%d", time.localtime(today - i * 86400))
+            rows = {r[0] for r in
+                    _egg_db.execute("SELECT hen FROM eggs WHERE date=?", (d,))}
+            out.append({"date": d,
+                        "hens": {h["id"]: (h["id"] in rows) for h in HENS}})
+    return out
+
+
 def motor_temp():
     """Fetch the motor Pi's CPU temperature (°C) or None."""
     try:
@@ -596,11 +952,11 @@ def motor_temp():
 
 
 # ── temperature logging ─────────────────────────────────────────────────────────
+# RAM only — nothing is written to the SD card. The graph is a rolling window of
+# the last TEMP_HISTORY_HOURS and simply starts empty again after a restart.
 
-TEMPS_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temps.json")
 _temps      = []                       # [[epoch:int, cam:float|None, motor:float|None], ...]
 _temps_lock = threading.Lock()
-_last_flush = 0.0                      # last time samples were written to disk
 
 
 def read_cpu_temp():
@@ -612,43 +968,9 @@ def read_cpu_temp():
         return None
 
 
-def _load_temps():
-    global _temps
-    try:
-        with open(TEMPS_FILE) as f:
-            data = json.load(f)
-        if isinstance(data, list):
-            cutoff = int(time.time()) - TEMP_HISTORY_HOURS * 3600
-            _temps = [s for s in data if isinstance(s, list) and s and s[0] >= cutoff]
-            print(f"[temps] loaded {len(_temps)} samples")
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        print(f"[temps] load failed: {e}")
-
-
-def _save_temps_locked():
-    try:
-        tmp = TEMPS_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(_temps, f)
-        os.replace(tmp, TEMPS_FILE)        # atomic, avoids a half-written file
-    except Exception as e:
-        print(f"[temps] save failed: {e}")
-
-
-def flush_temps():
-    """Persist the in-memory samples. Called on the flush interval and on exit."""
-    global _last_flush
-    with _temps_lock:
-        _save_temps_locked()
-        _last_flush = time.time()
-
-
 def _temp_sampler():
-    global _last_flush
     print(f"[temps] sampling every {TEMP_SAMPLE_SEC}s, "
-          f"flushing to disk every {TEMP_FLUSH_SEC}s, keeping {TEMP_HISTORY_HOURS}h")
+          f"keeping {TEMP_HISTORY_HOURS}h in memory (no disk writes)")
     while True:
         ts  = int(time.time())
         cam = read_cpu_temp()
@@ -658,11 +980,6 @@ def _temp_sampler():
             _temps.append([ts, cam, mot])
             while _temps and _temps[0][0] < cutoff:
                 _temps.pop(0)
-            # Samples live in RAM; only touch the SD card every TEMP_FLUSH_SEC.
-            # Writing once per sample burned ~1440 full-file rewrites a day.
-            if ts - _last_flush >= TEMP_FLUSH_SEC:
-                _save_temps_locked()
-                _last_flush = ts
         time.sleep(TEMP_SAMPLE_SEC)
 
 
@@ -830,6 +1147,49 @@ header{width:100%;max-width:1100px;display:flex;align-items:center;gap:14px;flex
 .lim.on{color:var(--green)}
 .lim.on .ldot{background:var(--green);border-color:var(--green);box-shadow:0 0 6px var(--green)}
 .mbtn:disabled{opacity:.35;cursor:not-allowed;filter:grayscale(.5)}
+/* door schedule */
+.sched-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.sw{display:flex;align-items:center;gap:6px;font-family:monospace;font-size:.68rem;
+  color:var(--text);cursor:pointer}
+.sw input{accent-color:var(--green);width:15px;height:15px;cursor:pointer}
+.tm{font-family:monospace;font-size:.78rem;color:var(--text);background:var(--bg);
+  border:1px solid var(--border);border-radius:6px;padding:6px 8px}
+.tm:focus{outline:none;border-color:var(--green2)}
+/* egg log */
+.egg-panel{width:100%;background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--r);padding:18px 20px;display:flex;flex-direction:column;gap:16px}
+.egg-head{display:flex;align-items:center;gap:12px}
+.egg-date{font-family:monospace;font-size:.68rem;color:var(--muted);margin-left:auto}
+.egg-store{margin-left:8px;padding:2px 7px;border-radius:20px;font-size:.6rem;
+  background:var(--green-dim);color:var(--green);border:1px solid rgba(0,201,125,.3)}
+.egg-store.bad{background:var(--amber-dim);color:var(--amber);
+  border-color:rgba(255,179,64,.35)}
+.egg-save{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.egg-unsaved{font-family:monospace;font-size:.66rem;color:var(--muted)}
+.egg-unsaved.on{color:var(--amber);font-weight:700}
+.egg-today{display:flex;gap:10px;flex-wrap:wrap}
+.egg-btn{flex:1 1 150px;display:flex;flex-direction:column;align-items:center;gap:6px;
+  padding:14px 10px;border-radius:var(--r);cursor:pointer;font-family:monospace;
+  background:rgba(90,96,112,.12);border:1px solid var(--border);color:var(--muted)}
+.egg-btn .ei{font-size:1.7rem;line-height:1}
+.egg-btn .en{font-size:.74rem;font-weight:700}
+.egg-btn.on{background:var(--amber-dim);border-color:rgba(255,179,64,.5);color:var(--amber)}
+.egg-btn:hover{border-color:var(--green2)}
+.egg-grid-wrap{width:100%;overflow-x:auto}
+.egg-grid{display:grid;gap:2px;min-width:520px}
+.gh{font-family:monospace;font-size:.55rem;color:var(--muted);text-align:center;
+  padding:3px 0}
+.gn{font-family:monospace;font-size:.66rem;color:var(--text);padding:4px 8px 4px 0;
+  white-space:nowrap}
+.gc{display:flex;align-items:center;justify-content:center;font-size:.8rem;
+  color:var(--border);background:var(--bg);border-radius:3px;padding:5px 0;cursor:pointer}
+.gc:hover{outline:1px solid var(--green2)}
+.gc.on{color:var(--amber);background:var(--amber-dim)}
+.egg-totals{display:flex;gap:14px;flex-wrap:wrap;font-family:monospace;font-size:.68rem;
+  color:var(--muted);border-top:1px solid var(--border);padding-top:12px}
+.egg-tot b{color:var(--text);font-weight:700}
+.egg-tot.all{margin-left:auto}
+.egg-tot.all b{color:var(--amber)}
 .acts{display:flex;flex-direction:column;gap:6px}
 .acts-label{font-family:monospace;font-size:.6rem;font-weight:700;letter-spacing:.1em;
   text-transform:uppercase;color:var(--muted)}
@@ -920,11 +1280,12 @@ var PANEL = {L: 'left', R: 'right'};
 function kindLabel(kind){ return kind === 'uvc' ? 'Outside' : 'Indoor'; }
 
 function showTab(name){
-  ['live', 'temps'].forEach(function(t){
+  ['live', 'eggs', 'temps'].forEach(function(t){
     document.getElementById('tab-' + t).classList.toggle('active', t === name);
     document.getElementById('tab-btn-' + t).classList.toggle('active', t === name);
   });
   if (name === 'temps') loadTemps();
+  if (name === 'eggs')  loadEggs();
 }
 
 function assign(slot, cam) {
@@ -1127,7 +1488,12 @@ loadActions();
 function loadConfig() {
   fetch('/config')
   .then(function(r){ return r.json(); })
-  .then(function(d){ document.getElementById('ip-input').value = d.motor_pi_ip || ''; })
+  .then(function(d){
+    document.getElementById('ip-input').value = d.motor_pi_ip || '';
+    var u = document.getElementById('egg-url');   var t = document.getElementById('egg-token');
+    if (u) u.value = d.egg_db_url || '';
+    if (t) t.value = d.egg_db_token || '';
+  })
   .catch(function(){});
 }
 function saveMotorIp() {
@@ -1144,6 +1510,154 @@ function saveMotorIp() {
   .catch(function(){ st.textContent = 'Network error'; st.style.color = 'var(--red)'; });
 }
 loadConfig();
+
+// ── door schedule ───────────────────────────────────────────────────────────
+function loadSchedule() {
+  fetch('/schedule').then(function(r){ return r.json(); }).then(function(s){
+    document.getElementById('sch-open-en').checked  = !!s.open_enabled;
+    document.getElementById('sch-open-tm').value    = s.open_time  || '07:00';
+    document.getElementById('sch-close-en').checked = !!s.close_enabled;
+    document.getElementById('sch-close-tm').value   = s.close_time || '21:00';
+  }).catch(function(){});
+}
+function saveSchedule() {
+  var st = document.getElementById('sch-status');
+  fetch('/schedule', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({
+      open_enabled:  document.getElementById('sch-open-en').checked,
+      open_time:     document.getElementById('sch-open-tm').value,
+      close_enabled: document.getElementById('sch-close-en').checked,
+      close_time:    document.getElementById('sch-close-tm').value
+    })})
+  .then(function(r){ return r.json(); })
+  .then(function(d){
+    st.textContent = d.ok ? 'Saved \\u2713' : (d.error || 'error');
+    st.style.color = d.ok ? 'var(--green)' : 'var(--red)';
+    setTimeout(function(){ st.textContent = ''; }, 3000);
+  })
+  .catch(function(){ st.textContent = 'Network error'; st.style.color = 'var(--red)'; });
+}
+loadSchedule();
+
+// ── egg log ─────────────────────────────────────────────────────────────────
+var EGG_DAYS = 14;
+function toggleEgg(date, hen, laid) {
+  fetch('/eggs', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({date: date, hen: hen, laid: laid})})
+  .then(function(){ loadEggs(); }).catch(function(){});
+}
+function loadEggs() {
+  fetch('/eggs?days=' + EGG_DAYS).then(function(r){ return r.json(); })
+  .then(function(d){
+    var hens = d.hens || [], days = d.days || [], today = d.today;
+    var store = !d.store ? 'in memory \\u2014 download to keep'
+              : (d.online === false ? '\\u26A0 ' + d.store + ' unreachable'
+                                    : '\\u2713 ' + d.store);
+    document.getElementById('egg-today').innerHTML =
+      today + ' <span class="egg-store' + (d.online === false ? ' bad' : '')
+            + '">' + store + '</span>';
+    var u = document.getElementById('egg-unsaved');
+    if (d.unsaved) {
+      u.textContent = d.unsaved + ' change' + (d.unsaved > 1 ? 's' : '')
+                    + ' not downloaded';
+      u.className = 'egg-unsaved on';
+    } else {
+      u.textContent = d.saved_at ? 'Downloaded \\u2713' : 'No changes';
+      u.className = 'egg-unsaved';
+    }
+    var last = days.length ? days[days.length-1] : {hens:{}};
+
+    // today's toggles
+    var tg = document.getElementById('egg-toggles');
+    tg.innerHTML = '';
+    hens.forEach(function(h){
+      var on = !!(last.hens && last.hens[h.id]);
+      var b  = document.createElement('button');
+      b.className = 'egg-btn' + (on ? ' on' : '');
+      b.innerHTML = '<span class="ei">' + (on ? '\\uD83E\\uDD5A' : '\\u2014')
+                  + '</span><span class="en">' + h.name + '</span>';
+      b.onclick = function(){ toggleEgg(today, h.id, !on); };
+      tg.appendChild(b);
+    });
+
+    // history grid: one row per hen, one cell per day
+    var g = document.getElementById('egg-grid');
+    g.innerHTML = '';
+    g.style.gridTemplateColumns = 'minmax(90px,auto) repeat(' + days.length + ',1fr)';
+    g.appendChild(cell('', 'gh'));
+    days.forEach(function(x){
+      g.appendChild(cell(x.date.slice(8) + '/' + x.date.slice(5,7), 'gh'));
+    });
+    hens.forEach(function(h){
+      g.appendChild(cell(h.name, 'gn'));
+      days.forEach(function(x){
+        var on = !!x.hens[h.id];
+        var c  = cell(on ? '\\u25CF' : '\\u00B7', 'gc' + (on ? ' on' : ''));
+        c.title = h.name + ' \\u2014 ' + x.date + (on ? ': egg' : ': none');
+        c.onclick = function(){ toggleEgg(x.date, h.id, !on); };
+        g.appendChild(c);
+      });
+    });
+
+    // totals
+    var tot = document.getElementById('egg-totals');
+    tot.innerHTML = '';
+    hens.forEach(function(h){
+      var n = days.filter(function(x){ return x.hens[h.id]; }).length;
+      var s = document.createElement('span');
+      s.className = 'egg-tot';
+      s.innerHTML = '<b>' + h.name + '</b> ' + n + '/' + days.length + ' days';
+      tot.appendChild(s);
+    });
+    var all = days.reduce(function(a,x){
+      return a + hens.filter(function(h){ return x.hens[h.id]; }).length; }, 0);
+    var s2 = document.createElement('span');
+    s2.className = 'egg-tot all';
+    s2.innerHTML = '<b>Total</b> ' + all + ' eggs / ' + days.length + ' days';
+    tot.appendChild(s2);
+  }).catch(function(){});
+}
+function cell(txt, cls) {
+  var d = document.createElement('div');
+  d.className = cls; d.textContent = txt;
+  return d;
+}
+function uploadEggs(input) {
+  var f = input.files && input.files[0];
+  if (!f) return;
+  if (!confirm('Replace the current egg log with "' + f.name + '"?')) {
+    input.value = ''; return;
+  }
+  var st = document.getElementById('egg-save-status');
+  st.textContent = 'Restoring\\u2026'; st.style.color = 'var(--muted)';
+  f.arrayBuffer().then(function(buf){
+    return fetch('/eggs/upload', {method:'POST',
+      headers:{'Content-Type':'application/octet-stream'}, body: buf});
+  })
+  .then(function(r){ return r.json(); })
+  .then(function(d){
+    st.textContent = d.ok ? (d.msg || 'Restored \\u2713') : (d.error || 'failed');
+    st.style.color = d.ok ? 'var(--green)' : 'var(--red)';
+    setTimeout(function(){ st.textContent = ''; }, 5000);
+    loadEggs();
+  })
+  .catch(function(){ st.textContent = 'Upload failed'; st.style.color = 'var(--red)'; })
+  .then(function(){ input.value = ''; });
+}
+function saveEggDb() {
+  var st = document.getElementById('egg-db-status');
+  fetch('/config', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({egg_db_url: document.getElementById('egg-url').value,
+                          egg_db_token: document.getElementById('egg-token').value})})
+  .then(function(r){ return r.json(); })
+  .then(function(d){
+    st.textContent = d.ok ? 'Saved \\u2713' : (d.error || 'error');
+    st.style.color = d.ok ? 'var(--green)' : 'var(--red)';
+    setTimeout(function(){ st.textContent = ''; }, 3000);
+    if (d.ok) loadEggs();
+  })
+  .catch(function(){ st.textContent = 'Network error'; st.style.color = 'var(--red)'; });
+}
 
 // dashboard + motor server versions
 function loadVersions() {
@@ -1303,6 +1817,8 @@ def build_dashboard(cameras):
         '<nav class="tabs" role="tablist">\n'
         '  <button class="tab active" id="tab-btn-live" onclick="showTab(\'live\')">'
         '&#128247; Live</button>\n'
+        '  <button class="tab" id="tab-btn-eggs" onclick="showTab(\'eggs\')">'
+        '&#129370; Eggs</button>\n'
         '  <button class="tab" id="tab-btn-temps" onclick="showTab(\'temps\')">'
         '&#127777; Temps</button>\n'
         '</nav>\n'
@@ -1342,6 +1858,17 @@ def build_dashboard(cameras):
         '    <button class="ip-save" onclick="saveMotorIp()">Save</button>\n'
         '    <span class="ip-status" id="ip-status"></span>\n'
         '  </div>\n'
+        '  <div class="sched-row">\n'
+        '    <span class="ip-label">Schedule</span>\n'
+        '    <label class="sw"><input type="checkbox" id="sch-open-en"/>'
+        '<span>Open at</span></label>\n'
+        '    <input class="tm" id="sch-open-tm" type="time" value="07:00"/>\n'
+        '    <label class="sw"><input type="checkbox" id="sch-close-en"/>'
+        '<span>Close at</span></label>\n'
+        '    <input class="tm" id="sch-close-tm" type="time" value="21:00"/>\n'
+        '    <button class="ip-save" onclick="saveSchedule()">Save</button>\n'
+        '    <span class="ip-status" id="sch-status"></span>\n'
+        '  </div>\n'
         '  <div class="acts">\n'
         '    <span class="acts-label">Recent actions <i>(this session only)</i></span>\n'
         '    <ul class="acts-list" id="acts-list"><li class="acts-none">None yet</li></ul>\n'
@@ -1352,6 +1879,39 @@ def build_dashboard(cameras):
         '    <div class="kh"><kbd>S</kbd> Force stop</div>\n'
         '  </div>\n'
         '</div>\n'
+        '</section>\n'
+        '<section class="tab-panel" id="tab-eggs">\n'
+        '  <div class="egg-panel">\n'
+        '    <div class="egg-head">\n'
+        '      <span class="door-title">&#129370; Egg log</span>\n'
+        '      <span class="egg-date" id="egg-today"></span>\n'
+        '    </div>\n'
+        '    <div class="egg-save">\n'
+        '      <a class="ip-save" href="/eggs/download" download>'
+        '&#11015; Save .db to this device</a>\n'
+        '      <a class="pc-btn pc-restart" href="/eggs/export.csv" download>'
+        '&#11015; CSV</a>\n'
+        '      <button class="pc-btn pc-restart" onclick="'
+        'document.getElementById(\'egg-file\').click()">&#11014; Restore</button>\n'
+        '      <input type="file" id="egg-file" accept=".db,.csv" style="display:none" '
+        'onchange="uploadEggs(this)"/>\n'
+        '      <span class="egg-unsaved" id="egg-unsaved"></span>\n'
+        '      <span class="ip-status" id="egg-save-status"></span>\n'
+        '    </div>\n'
+        '    <div class="egg-today" id="egg-toggles"></div>\n'
+        '    <div class="egg-grid-wrap"><div class="egg-grid" id="egg-grid"></div></div>\n'
+        '    <div class="egg-totals" id="egg-totals"></div>\n'
+        '    <div class="ip-row">\n'
+        '      <label class="ip-label" for="egg-url">Egg database</label>\n'
+        '      <input class="ip-input" id="egg-url" type="text" spellcheck="false"\n'
+        '             autocomplete="off" placeholder="http://192.168.1.50:8090 '
+        '(blank = store on Pi)"/>\n'
+        '      <input class="ip-input" id="egg-token" type="password"\n'
+        '             autocomplete="off" placeholder="token (optional)" style="flex:0 1 150px"/>\n'
+        '      <button class="ip-save" onclick="saveEggDb()">Save</button>\n'
+        '      <span class="ip-status" id="egg-db-status"></span>\n'
+        '    </div>\n'
+        '  </div>\n'
         '</section>\n'
         '<section class="tab-panel" id="tab-temps">\n'
         '  <div class="temp-panel">\n'
@@ -1390,6 +1950,17 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _download(self, body, filename, ctype="application/octet-stream"):
+        """Send bytes as a browser download (saves to the viewer's machine)."""
+        if isinstance(body, str):
+            body = body.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -1462,7 +2033,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(502, {"error": result})
 
         elif path == "/config":
-            self._json(200, {"motor_pi_ip": get_motor_ip(), "motor_port": MOTOR_PORT})
+            url, token = get_egg_db()
+            self._json(200, {"motor_pi_ip": get_motor_ip(), "motor_port": MOTOR_PORT,
+                             "egg_db_url": url, "egg_db_token": token})
 
         elif path == "/pipeline":
             self._json(200, {"sdk": REALSENSE_SDK,
@@ -1470,6 +2043,31 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path == "/version":
             self._json(200, {"dashboard": VERSION, "motor": motor_version()})
+
+        elif path == "/schedule":
+            self._json(200, get_schedule())
+
+        elif path == "/eggs":
+            try:
+                days = max(1, min(int(self.parse_qs().get("days", 14)), 90))
+            except ValueError:
+                days = 14
+            url, _ = get_egg_db()
+            self._json(200, {"hens": HENS, "days": eggs_range(days),
+                             "today": time.strftime("%Y-%m-%d"),
+                             "store": url or "",
+                             "online": _egg_online,
+                             "unsaved": _egg_dirty,
+                             "saved_at": _egg_saved})
+
+        elif path == "/eggs/download":
+            stamp = time.strftime("%Y-%m-%d")
+            self._download(eggs_db_bytes(), f"eggs-{stamp}.db")
+            mark_eggs_downloaded()          # downloading the .db counts as saving
+
+        elif path == "/eggs/export.csv":
+            stamp = time.strftime("%Y-%m-%d")
+            self._download(eggs_csv(), f"eggs-{stamp}.csv", "text/csv; charset=utf-8")
 
         elif path == "/actions":
             with _actions_lock:
@@ -1486,10 +2084,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?")[0]
-        if path not in ("/motor", "/config", "/pipeline"):
+        if path not in ("/motor", "/config", "/pipeline", "/schedule",
+                        "/eggs", "/eggs/save", "/eggs/reload", "/eggs/upload"):
             self.send_error(404)
             return
         length = int(self.headers.get("Content-Length", 0))
+
+        if path == "/eggs/upload":          # raw .db bytes, not JSON
+            if length <= 0 or length > 20 * 1024 * 1024:
+                self._json(400, {"ok": False, "error": "bad upload size"})
+                return
+            ok, msg = eggs_load_bytes(self.rfile.read(length))
+            self._json(200 if ok else 400,
+                       {"ok": ok, "msg" if ok else "error": msg})
+            return
+
         try:
             data = json.loads(self.rfile.read(length))
         except Exception:
@@ -1497,11 +2106,47 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/config":
+            if "egg_db_url" in data:      # egg store settings
+                ok, result = set_egg_db(data.get("egg_db_url", ""),
+                                        data.get("egg_db_token", ""))
+                if ok:
+                    _load_eggs()          # re-read from the new store
+                    self._json(200, {"ok": True, "egg_db_url": result})
+                else:
+                    self._json(400, {"ok": False, "error": result})
+                return
             ok, result = set_motor_ip(data.get("motor_pi_ip", ""))
             if ok:
                 self._json(200, {"ok": True, "motor_pi_ip": result})
             else:
                 self._json(400, {"ok": False, "error": result})
+            return
+
+        if path == "/schedule":
+            ok, result = set_schedule(data)
+            if ok:
+                self._json(200, {"ok": True, "schedule": result})
+            else:
+                self._json(400, {"ok": False, "error": result})
+            return
+
+        if path == "/eggs":
+            ok, err = set_egg(data.get("date", ""), data.get("hen", ""),
+                              bool(data.get("laid")))
+            if ok:
+                self._json(200, {"ok": True, "unsaved": _egg_dirty})
+            else:
+                self._json(400, {"ok": False, "error": err})
+            return
+
+        if path == "/eggs/save":
+            ok, msg = save_eggs()
+            self._json(200 if ok else 502, {"ok": ok, "msg" if ok else "error": msg})
+            return
+
+        if path == "/eggs/reload":
+            _load_eggs()          # discard memory, re-pull from the laptop
+            self._json(200, {"ok": _egg_online is True, "online": _egg_online})
             return
 
         if path == "/pipeline":
@@ -1559,15 +2204,15 @@ def _cleanup():
     for s in streams:
         print(f"[dashboard] stopping ffmpeg for {s.device}...")
         s.stop()
-    flush_temps()      # write buffered samples so a clean stop loses nothing
 
 
 if __name__ == "__main__":
     import signal, atexit
 
     _load_config()
-    _load_temps()
+    _load_eggs()
     threading.Thread(target=_temp_sampler, daemon=True).start()
+    threading.Thread(target=_scheduler, daemon=True).start()
     cams = get_cameras(force=True)     # warm the cache while the device is idle
     print(f"[dashboard] cameras: {[c['name'] for c in cams] or 'none'}")
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
