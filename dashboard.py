@@ -71,7 +71,7 @@ def encode_jpeg(arr, gray, quality=80):
     return None
 
 # ── config ────────────────────────────────────────────────────────────────────
-VERSION     = "1.11.0"
+VERSION     = "1.12.0"
 PORT        = 8080
 FPS         = 10          # ffmpeg/UVC: lower FPS reduces USB bandwidth contention
 REALSENSE_FPS = 15        # Indoor camera. 15 is verified working on this D4xx;
@@ -505,10 +505,10 @@ CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # Whole config lives in one dict so saving one setting can't clobber another.
 _config = {
     "motor_pi_ip": MOTOR_PI_IP,
-    # Remote egg store, e.g. "http://192.168.1.50:8090" (egg_collector.py).
-    # Empty = keep eggs in a local file on the Pi.
-    "egg_db_url":  "",
-    "egg_db_token": "",
+    # Supabase egg store. URL like "https://xxxx.supabase.co", key = anon key.
+    # Empty = keep eggs in memory only (download to back up).
+    "supabase_url": "",
+    "supabase_key": "",
     "schedule": {
         "open_enabled":  True,
         "open_time":     "07:00",
@@ -545,7 +545,7 @@ def _load_config():
         ip = data.get("motor_pi_ip")
         if ip and _IP_RE.match(ip):
             _config["motor_pi_ip"] = ip
-        for k in ("egg_db_url", "egg_db_token"):
+        for k in ("supabase_url", "supabase_key"):
             if isinstance(data.get(k), str):
                 _config[k] = data[k].strip()
         sch = data.get("schedule")
@@ -570,24 +570,26 @@ def get_schedule():
         return dict(_config["schedule"])
 
 
-def get_egg_db():
+def get_supabase():
     with _config_lock:
-        return _config["egg_db_url"], _config["egg_db_token"]
+        return _config["supabase_url"], _config["supabase_key"]
 
 
-def set_egg_db(url, token):
-    """Point the egg log at a remote collector ('' = store locally)."""
+def set_supabase(url, key):
+    """Point the egg log at a Supabase project ('' url = memory only).
+    key=None keeps the currently stored key (so you needn't retype it)."""
     url = (url or "").strip().rstrip("/")
-    if url and not re.match(r"^https?://[A-Za-z0-9.\-]+(:\d+)?$", url):
-        return False, "URL must look like http://host:port"
+    if url and not re.match(r"^https://[A-Za-z0-9.\-]+\.supabase\.co$", url):
+        return False, "URL must look like https://xxxx.supabase.co"
     with _config_lock:
-        _config["egg_db_url"]   = url
-        _config["egg_db_token"] = (token or "").strip()
+        _config["supabase_url"] = url
+        if key is not None:
+            _config["supabase_key"] = key.strip()
         try:
             _save_config_locked()
         except Exception as e:
             return False, f"saved in memory but write failed: {e}"
-    print(f"[eggs] store = {url or 'local file'}")
+    print(f"[eggs] store = {url or 'memory only'}")
     return True, url
 
 
@@ -712,10 +714,11 @@ def _scheduler():
 
 
 # ── egg log ───────────────────────────────────────────────────────────────────
-# Lives in an in-memory SQLite database — nothing is ever written to the SD card.
-# Pulled from the laptop's collector at startup; pushed back only when you press
-# "Save to laptop". Unsaved taps are lost if the dashboard restarts, so the UI
-# shows an unsaved-changes badge.
+# The live copy is an in-memory SQLite DB (instant UI, zero SD writes). When a
+# Supabase project is configured it becomes the source of truth: on startup the
+# cache is seeded from Supabase, and every tap is written through to it. Writes
+# that can't reach Supabase are queued in RAM and retried, so a network blip
+# never blocks or loses a tap. Memory-only if no Supabase configured.
 
 HENS = [
     {"id": "grun",   "name": "Miss Grün",  "color": "#3ddc84"},   # green
@@ -727,10 +730,10 @@ _HEN_IDS   = {h["id"] for h in HENS}
 _eggs_lock = threading.Lock()
 _DATE_RE   = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
-_egg_db     = sqlite3.connect(":memory:", check_same_thread=False)
-_egg_dirty  = 0                # unsaved changes since the last successful save
-_egg_saved  = None             # epoch of last successful save
-_egg_online = None             # last known reachability of the collector
+_egg_db      = sqlite3.connect(":memory:", check_same_thread=False)
+_egg_saved   = None            # epoch of last successful sync to Supabase
+_egg_online  = None            # last known reachability of Supabase
+_egg_pending = deque(maxlen=1000)   # queued writes waiting to reach Supabase
 
 with _eggs_lock:
     _egg_db.execute("""CREATE TABLE IF NOT EXISTS eggs (
@@ -739,23 +742,45 @@ with _eggs_lock:
                            PRIMARY KEY (date, hen))""")
 
 
-def _egg_req(path, payload=None, timeout=8):
-    """Call the remote collector. Returns parsed JSON, raises on failure."""
-    url, token = get_egg_db()
-    if not url:
-        raise RuntimeError("no egg database configured")
-    headers = {"Content-Type": "application/json"}
-    if token:
-        headers["X-Token"] = token
-    body = json.dumps(payload).encode() if payload is not None else None
-    req  = Request(url + path, data=body, headers=headers,
-                   method="POST" if payload is not None else "GET")
+def egg_backend():
+    url, _ = get_supabase()
+    return "supabase" if url else "memory"
+
+
+# ── Supabase REST helpers ──
+def _sb_request(method, path, body=None, timeout=8, prefer=None):
+    url, key = get_supabase()
+    if not url or not key:
+        raise RuntimeError("Supabase not configured")
+    headers = {"apikey": key, "Authorization": f"Bearer {key}",
+               "Content-Type": "application/json"}
+    if prefer:
+        headers["Prefer"] = prefer
+    data = json.dumps(body).encode() if body is not None else None
+    req  = Request(url + "/rest/v1" + path, data=data, headers=headers, method=method)
     with urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read())
+        raw = r.read()
+        return json.loads(raw) if raw else None
+
+
+def _sb_upsert(date, hen):
+    # merge-duplicates makes re-inserting the same egg a harmless no-op.
+    _sb_request("POST", "/eggs", [{"date": date, "hen": hen}],
+                prefer="resolution=merge-duplicates,return=minimal")
+
+
+def _sb_delete(date, hen):
+    _sb_request("DELETE", f"/eggs?date=eq.{date}&hen=eq.{hen}",
+                prefer="return=minimal")
+
+
+def _sb_fetch():
+    rows = _sb_request("GET", f"/eggs?select=date,hen&date=gte.{EGGS_SINCE}") or []
+    return [(r["date"], r["hen"]) for r in rows]
 
 
 def _eggs_snapshot():
-    """Whole in-memory DB as {date: {hen: True}} — the payload we push."""
+    """Whole in-memory DB as {date: {hen: True}} — used for backup/download."""
     out = {}
     with _eggs_lock:
         for date, hen in _egg_db.execute("SELECT date, hen FROM eggs"):
@@ -763,66 +788,81 @@ def _eggs_snapshot():
     return out
 
 
+def _fill_cache(rows):
+    with _eggs_lock:
+        _egg_db.execute("DELETE FROM eggs")
+        for date, hen in rows:
+            if _DATE_RE.match(str(date)) and hen in _HEN_IDS:
+                _egg_db.execute("INSERT OR IGNORE INTO eggs VALUES(?,?)", (date, hen))
+        return _egg_db.execute("SELECT COUNT(*) FROM eggs").fetchone()[0]
+
+
 def _load_eggs():
-    """Seed the in-memory DB from the laptop's collector."""
-    global _egg_online, _egg_dirty
-    url, _ = get_egg_db()
-    if not url:
-        print("[eggs] no egg database configured — memory only")
+    """Seed the cache from Supabase (or leave it as-is for memory-only)."""
+    global _egg_online, _egg_saved
+    if egg_backend() != "supabase":
+        print("[eggs] memory only — no Supabase configured")
         return
     try:
-        data = _egg_req("/eggs").get("eggs", {})
-        with _eggs_lock:
-            _egg_db.execute("DELETE FROM eggs")
-            for d, hens in data.items():
-                if not _DATE_RE.match(d) or not isinstance(hens, dict):
-                    continue
-                for hen, laid in hens.items():
-                    if laid and hen in _HEN_IDS:
-                        _egg_db.execute("INSERT OR IGNORE INTO eggs VALUES(?,?)", (d, hen))
-            n = _egg_db.execute("SELECT COUNT(DISTINCT date) FROM eggs").fetchone()[0]
-        _egg_dirty  = 0
+        n = _fill_cache(_sb_fetch())
         _egg_online = True
-        print(f"[eggs] loaded {n} days from {url}")
+        _egg_saved  = time.time()
+        print(f"[eggs] loaded {n} eggs from Supabase")
     except Exception as e:
         _egg_online = False
-        print(f"[eggs] could not load from {url}: {e}")
+        print(f"[eggs] could not load from Supabase ({e}); cache kept, will retry")
 
 
 def set_egg(date, hen, laid):
-    """Record a hen laying, in memory only. Returns (ok, error)."""
-    global _egg_dirty
+    """Record a hen laying. Writes through to Supabase (queued if it's down)."""
+    global _egg_online
     if not _DATE_RE.match(str(date)):
         return False, "date must be YYYY-MM-DD"
     if hen not in _HEN_IDS:
         return False, f"unknown hen: {hen}"
+
+    # Cache first so the UI is instant regardless of the network.
     with _eggs_lock:
         if laid:
             _egg_db.execute("INSERT OR IGNORE INTO eggs VALUES(?,?)", (date, hen))
         else:
             _egg_db.execute("DELETE FROM eggs WHERE date=? AND hen=?", (date, hen))
-    _egg_dirty += 1
+
+    if egg_backend() != "supabase":
+        return True, None            # memory only
+
+    op = ("upsert" if laid else "delete", date, hen)
+    try:
+        (_sb_upsert if laid else _sb_delete)(date, hen)
+        _egg_online = True
+    except Exception as e:
+        _egg_pending.append(op)
+        _egg_online = False
+        print(f"[eggs] queued ({len(_egg_pending)} pending): {e}")
     return True, None
 
 
-def save_eggs():
-    """Push the whole in-memory DB to the laptop. Returns (ok, msg)."""
-    global _egg_dirty, _egg_saved, _egg_online
-    url, _ = get_egg_db()
-    if not url:
-        return False, "no egg database configured"
-    snap = _eggs_snapshot()
-    try:
-        res = _egg_req("/eggs/bulk", {"eggs": snap}, timeout=20)
-    except Exception as e:
-        _egg_online = False
-        return False, str(e)
-    _egg_dirty  = 0
-    _egg_saved  = time.time()
-    _egg_online = True
-    msg = f"{res.get('days', len(snap))} days, {res.get('rows', 0)} eggs"
-    print(f"[eggs] saved to {url}: {msg}")
-    return True, msg
+def _egg_sync():
+    """Drain queued writes and periodically re-pull from Supabase."""
+    global _egg_online, _egg_saved
+    last_fetch = 0.0
+    while True:
+        try:
+            if egg_backend() == "supabase":
+                while _egg_pending:                     # flush the outbox in order
+                    kind, date, hen = _egg_pending[0]
+                    (_sb_upsert if kind == "upsert" else _sb_delete)(date, hen)
+                    _egg_pending.popleft()
+                    print(f"[eggs] flushed queued {kind} {date} {hen}")
+                if time.time() - last_fetch > 300:      # reconcile every 5 min
+                    _fill_cache(_sb_fetch())
+                    last_fetch = time.time()
+                _egg_online = True
+                _egg_saved  = time.time()
+        except Exception as e:
+            _egg_online = False
+            print(f"[eggs] sync failed ({len(_egg_pending)} pending): {e}")
+        time.sleep(15)
 
 
 def _ram_tmp(name):
@@ -851,13 +891,6 @@ def eggs_db_bytes():
                 os.remove(path)
             except OSError:
                 pass
-
-
-def mark_eggs_downloaded():
-    """The log has been exported off the Pi, so it's no longer 'unsaved'."""
-    global _egg_dirty, _egg_saved
-    _egg_dirty = 0
-    _egg_saved = time.time()
 
 
 def eggs_csv():
@@ -907,7 +940,6 @@ def _rows_from_csv(text):
 
 def eggs_load_bytes(data):
     """Restore from an uploaded .db or .csv export. Returns (ok, msg)."""
-    global _egg_dirty
     try:
         if data[:15] == b"SQLite format 3":
             rows = _rows_from_db_bytes(data)
@@ -917,14 +949,12 @@ def eggs_load_bytes(data):
                 return False, "no egg rows found in file"
     except Exception as e:
         return False, f"could not read file: {e}"
-    n = 0
-    with _eggs_lock:
-        _egg_db.execute("DELETE FROM eggs")
-        for date, hen in rows:
-            if _DATE_RE.match(str(date)) and hen in _HEN_IDS:
-                _egg_db.execute("INSERT OR IGNORE INTO eggs VALUES(?,?)", (date, hen))
-                n += 1
-    _egg_dirty = 0
+    valid = [(d, h) for d, h in rows if _DATE_RE.match(str(d)) and h in _HEN_IDS]
+    n = _fill_cache(valid)
+    # If Supabase is the store, push the restored rows so they persist there too.
+    if egg_backend() == "supabase":
+        for d, h in valid:
+            _egg_pending.append(("upsert", d, h))
     print(f"[eggs] restored {n} eggs from upload")
     return True, f"restored {n} eggs"
 
@@ -1527,8 +1557,9 @@ function loadConfig() {
   .then(function(d){
     document.getElementById('ip-input').value = d.motor_pi_ip || '';
     var u = document.getElementById('egg-url');   var t = document.getElementById('egg-token');
-    if (u) u.value = d.egg_db_url || '';
-    if (t) t.value = d.egg_db_token || '';
+    if (u) u.value = d.supabase_url || '';
+    if (t) t.placeholder = d.supabase_key_set ? 'key saved (leave blank to keep)'
+                                              : 'anon key';
   })
   .catch(function(){});
 }
@@ -1591,20 +1622,20 @@ function loadEggs() {
   fetch('/eggs?days=' + EGG_DAYS).then(function(r){ return r.json(); })
   .then(function(d){
     var hens = d.hens || [], days = d.days || [], today = d.today;
-    var store = !d.store ? 'in memory \\u2014 download to keep'
-              : (d.online === false ? '\\u26A0 ' + d.store + ' unreachable'
-                                    : '\\u2713 ' + d.store);
+    var store = d.backend !== 'supabase' ? 'in memory \\u2014 download to keep'
+              : (d.online === false ? '\\u26A0 Supabase unreachable'
+                                    : '\\u2713 Supabase');
     document.getElementById('egg-today').innerHTML =
       today + (d.since ? ' <span class="egg-since">laying since ' + d.since + '</span>' : '')
-            + ' <span class="egg-store' + (d.online === false ? ' bad' : '')
-            + '">' + store + '</span>';
+            + ' <span class="egg-store' + (d.backend === 'supabase' && d.online === false
+                                           ? ' bad' : '') + '">' + store + '</span>';
     var u = document.getElementById('egg-unsaved');
-    if (d.unsaved) {
-      u.textContent = d.unsaved + ' change' + (d.unsaved > 1 ? 's' : '')
-                    + ' not downloaded';
+    if (d.pending) {
+      u.textContent = d.pending + ' change' + (d.pending > 1 ? 's' : '')
+                    + ' queued (Supabase offline)';
       u.className = 'egg-unsaved on';
     } else {
-      u.textContent = d.saved_at ? 'Downloaded \\u2713' : 'No changes';
+      u.textContent = d.backend === 'supabase' ? 'Synced to Supabase \\u2713' : '';
       u.className = 'egg-unsaved';
     }
     var last = days.length ? days[days.length-1] : {hens:{}};
@@ -1706,16 +1737,20 @@ function uploadEggs(input) {
   .then(function(){ input.value = ''; });
 }
 function saveEggDb() {
-  var st = document.getElementById('egg-db-status');
+  var st  = document.getElementById('egg-db-status');
+  var key = document.getElementById('egg-token').value;
+  var body = {supabase_url: document.getElementById('egg-url').value};
+  if (key) body.supabase_key = key;      // blank = keep the stored key
   fetch('/config', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({egg_db_url: document.getElementById('egg-url').value,
-                          egg_db_token: document.getElementById('egg-token').value})})
+    body: JSON.stringify(body)})
   .then(function(r){ return r.json(); })
   .then(function(d){
-    st.textContent = d.ok ? 'Saved \\u2713' : (d.error || 'error');
-    st.style.color = d.ok ? 'var(--green)' : 'var(--red)';
-    setTimeout(function(){ st.textContent = ''; }, 3000);
-    if (d.ok) loadEggs();
+    st.textContent = d.ok ? (d.online === false ? 'Saved, but Supabase unreachable'
+                                                : 'Saved \\u2713 connected')
+                          : (d.error || 'error');
+    st.style.color = d.ok && d.online !== false ? 'var(--green)' : 'var(--amber)';
+    setTimeout(function(){ st.textContent = ''; }, 5000);
+    if (d.ok) { document.getElementById('egg-token').value = ''; loadEggs(); }
   })
   .catch(function(){ st.textContent = 'Network error'; st.style.color = 'var(--red)'; });
 }
@@ -1963,12 +1998,12 @@ def build_dashboard(cameras):
         '    <div class="egg-grid-wrap"><div class="egg-grid" id="egg-grid"></div></div>\n'
         '    <div class="egg-totals" id="egg-totals"></div>\n'
         '    <div class="ip-row">\n'
-        '      <label class="ip-label" for="egg-url">Egg database</label>\n'
+        '      <label class="ip-label" for="egg-url">Supabase</label>\n'
         '      <input class="ip-input" id="egg-url" type="text" spellcheck="false"\n'
-        '             autocomplete="off" placeholder="http://192.168.1.50:8090 '
-        '(blank = store on Pi)"/>\n'
+        '             autocomplete="off" placeholder="https://xxxx.supabase.co '
+        '(blank = memory only)"/>\n'
         '      <input class="ip-input" id="egg-token" type="password"\n'
-        '             autocomplete="off" placeholder="token (optional)" style="flex:0 1 150px"/>\n'
+        '             autocomplete="off" placeholder="anon key" style="flex:0 1 180px"/>\n'
         '      <button class="ip-save" onclick="saveEggDb()">Save</button>\n'
         '      <span class="ip-status" id="egg-db-status"></span>\n'
         '    </div>\n'
@@ -2094,9 +2129,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(502, {"error": result})
 
         elif path == "/config":
-            url, token = get_egg_db()
+            sb_url, sb_key = get_supabase()
             self._json(200, {"motor_pi_ip": get_motor_ip(), "motor_port": MOTOR_PORT,
-                             "egg_db_url": url, "egg_db_token": token})
+                             "supabase_url": sb_url,
+                             "supabase_key_set": bool(sb_key)})
 
         elif path == "/pipeline":
             self._json(200, {"sdk": REALSENSE_SDK,
@@ -2113,20 +2149,17 @@ class Handler(BaseHTTPRequestHandler):
                 days = max(1, min(int(self.parse_qs().get("days", 30)), 365))
             except ValueError:
                 days = 30
-            url, _ = get_egg_db()
             self._json(200, {"hens": HENS, "days": eggs_range(days),
                              "today": time.strftime("%Y-%m-%d"),
                              "since": EGGS_SINCE,
                              "stats": eggs_stats(),
-                             "store": url or "",
+                             "backend": egg_backend(),
                              "online": _egg_online,
-                             "unsaved": _egg_dirty,
-                             "saved_at": _egg_saved})
+                             "pending": len(_egg_pending)})
 
         elif path == "/eggs/download":
             stamp = time.strftime("%Y-%m-%d")
             self._download(eggs_db_bytes(), f"eggs-{stamp}.db")
-            mark_eggs_downloaded()          # downloading the .db counts as saving
 
         elif path == "/eggs/export.csv":
             stamp = time.strftime("%Y-%m-%d")
@@ -2148,7 +2181,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = self.path.split("?")[0]
         if path not in ("/motor", "/config", "/pipeline", "/schedule",
-                        "/eggs", "/eggs/save", "/eggs/reload", "/eggs/upload"):
+                        "/eggs", "/eggs/upload"):
             self.send_error(404)
             return
         length = int(self.headers.get("Content-Length", 0))
@@ -2169,12 +2202,13 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/config":
-            if "egg_db_url" in data:      # egg store settings
-                ok, result = set_egg_db(data.get("egg_db_url", ""),
-                                        data.get("egg_db_token", ""))
+            if "supabase_url" in data:    # egg store settings
+                ok, result = set_supabase(data.get("supabase_url", ""),
+                                          data.get("supabase_key"))  # None = keep key
                 if ok:
-                    _load_eggs()          # re-read from the new store
-                    self._json(200, {"ok": True, "egg_db_url": result})
+                    _load_eggs()          # seed the cache from the new store
+                    self._json(200, {"ok": True, "supabase_url": result,
+                                     "online": _egg_online})
                 else:
                     self._json(400, {"ok": False, "error": result})
                 return
@@ -2197,19 +2231,9 @@ class Handler(BaseHTTPRequestHandler):
             ok, err = set_egg(data.get("date", ""), data.get("hen", ""),
                               bool(data.get("laid")))
             if ok:
-                self._json(200, {"ok": True, "unsaved": _egg_dirty})
+                self._json(200, {"ok": True, "pending": len(_egg_pending)})
             else:
                 self._json(400, {"ok": False, "error": err})
-            return
-
-        if path == "/eggs/save":
-            ok, msg = save_eggs()
-            self._json(200 if ok else 502, {"ok": ok, "msg" if ok else "error": msg})
-            return
-
-        if path == "/eggs/reload":
-            _load_eggs()          # discard memory, re-pull from the laptop
-            self._json(200, {"ok": _egg_online is True, "online": _egg_online})
             return
 
         if path == "/pipeline":
@@ -2276,6 +2300,7 @@ if __name__ == "__main__":
     _load_eggs()
     threading.Thread(target=_temp_sampler, daemon=True).start()
     threading.Thread(target=_scheduler, daemon=True).start()
+    threading.Thread(target=_egg_sync, daemon=True).start()
     cams = get_cameras(force=True)     # warm the cache while the device is idle
     print(f"[dashboard] cameras: {[c['name'] for c in cams] or 'none'}")
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
