@@ -71,7 +71,7 @@ def encode_jpeg(arr, gray, quality=80):
     return None
 
 # ── config ────────────────────────────────────────────────────────────────────
-VERSION     = "1.12.0"
+VERSION     = "1.14.0"
 PORT        = 8080
 FPS         = 10          # ffmpeg/UVC: lower FPS reduces USB bandwidth contention
 REALSENSE_FPS = 15        # Indoor camera. 15 is verified working on this D4xx;
@@ -510,10 +510,8 @@ _config = {
     "supabase_url": "",
     "supabase_key": "",
     "schedule": {
-        "open_enabled":  True,
-        "open_time":     "07:00",
-        "close_enabled": False,
-        "close_time":    "21:00",
+        "open1_enabled": True,  "open1_time": "07:00",
+        "open2_enabled": True,  "open2_time": "21:00",
     },
 }
 _config_lock = threading.Lock()
@@ -550,10 +548,10 @@ def _load_config():
                 _config[k] = data[k].strip()
         sch = data.get("schedule")
         if isinstance(sch, dict):
-            for k in ("open_enabled", "close_enabled"):
+            for k in ("open1_enabled", "open2_enabled"):
                 if k in sch:
                     _config["schedule"][k] = bool(sch[k])
-            for k in ("open_time", "close_time"):
+            for k in ("open1_time", "open2_time"):
                 if _TIME_RE.match(str(sch.get(k, ""))):
                     _config["schedule"][k] = sch[k]
     print(f"[config] motor Pi IP {_config['motor_pi_ip']}, "
@@ -612,14 +610,14 @@ def set_schedule(data):
     """Validate and persist the door schedule. Returns (ok, schedule|error)."""
     if not isinstance(data, dict):
         return False, "bad payload"
-    for k in ("open_time", "close_time"):
+    for k in ("open1_time", "open2_time"):
         if k in data and not _TIME_RE.match(str(data[k])):
             return False, f"{k} must be HH:MM (24h)"
     with _config_lock:
-        for k in ("open_enabled", "close_enabled"):
+        for k in ("open1_enabled", "open2_enabled"):
             if k in data:
                 _config["schedule"][k] = bool(data[k])
-        for k in ("open_time", "close_time"):
+        for k in ("open1_time", "open2_time"):
             if k in data:
                 _config["schedule"][k] = data[k]
         try:
@@ -697,17 +695,17 @@ def _scheduler():
             now   = time.localtime()
             today = time.strftime("%Y-%m-%d", now)
             hhmm  = time.strftime("%H:%M", now)
-            for action, cmd in (("open", "up"), ("close", "down")):
-                if not sch.get(action + "_enabled"):
+            for slot in ("open1", "open2"):       # both open the door
+                if not sch.get(slot + "_enabled"):
                     continue
-                if sch.get(action + "_time") != hhmm:
+                if sch.get(slot + "_time") != hhmm:
                     continue
-                if _sched_fired.get(action) == today:
+                if _sched_fired.get(slot) == today:
                     continue                      # already ran today
-                _sched_fired[action] = today
-                ok, res = motor_post(cmd)
-                log_action("schedule:" + action, ok, res)
-                print(f"[sched] {action} fired at {hhmm} -> ok={ok} {res}")
+                _sched_fired[slot] = today
+                ok, res = motor_post("up")
+                log_action("schedule:" + slot, ok, res)
+                print(f"[sched] {slot} open fired at {hhmm} -> ok={ok} {res}")
         except Exception as e:
             print(f"[sched] error: {e}")
         time.sleep(20)          # 20s tick: never misses an HH:MM window
@@ -863,100 +861,6 @@ def _egg_sync():
             _egg_online = False
             print(f"[eggs] sync failed ({len(_egg_pending)} pending): {e}")
         time.sleep(15)
-
-
-def _ram_tmp(name):
-    """A scratch path in RAM (/dev/shm) so nothing touches the SD card."""
-    import tempfile
-    d = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
-    return os.path.join(d, f"{name}-{os.getpid()}-{int(time.time()*1000)}.db")
-
-
-def eggs_db_bytes():
-    """The in-memory database as a real .db file, built entirely in RAM."""
-    with _eggs_lock:
-        try:
-            return _egg_db.serialize()          # Python 3.11+
-        except AttributeError:
-            pass
-        path = _ram_tmp("eggs-dl")
-        dest = sqlite3.connect(path)
-        try:
-            _egg_db.backup(dest)
-            dest.close()
-            with open(path, "rb") as f:
-                return f.read()
-        finally:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-
-
-def eggs_csv():
-    names = {h["id"]: h["name"] for h in HENS}
-    out = ["date,hen_id,hen_name"]
-    with _eggs_lock:
-        for date, hen in _egg_db.execute(
-                "SELECT date, hen FROM eggs ORDER BY date, hen"):
-            out.append(f'{date},{hen},"{names.get(hen, hen)}"')
-    return "\n".join(out) + "\n"
-
-
-def _rows_from_db_bytes(data):
-    """Read (date, hen) rows out of a .db file's bytes."""
-    try:                                    # Python 3.11+: straight from RAM
-        con = sqlite3.connect(":memory:")
-        con.deserialize(data)
-        rows = con.execute("SELECT date, hen FROM eggs").fetchall()
-        con.close()
-        return rows
-    except AttributeError:
-        pass
-    path = _ram_tmp("eggs-up")              # older Python: via a RAM-backed file
-    try:
-        with open(path, "wb") as f:
-            f.write(data)
-        src  = sqlite3.connect(path)
-        rows = src.execute("SELECT date, hen FROM eggs").fetchall()
-        src.close()
-        return rows
-    finally:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-
-
-def _rows_from_csv(text):
-    """Read (date, hen) rows out of our CSV export."""
-    rows = []
-    for line in text.splitlines():
-        parts = [p.strip().strip('"') for p in line.split(",")]
-        if len(parts) >= 2 and _DATE_RE.match(parts[0]):
-            rows.append((parts[0], parts[1]))
-    return rows
-
-
-def eggs_load_bytes(data):
-    """Restore from an uploaded .db or .csv export. Returns (ok, msg)."""
-    try:
-        if data[:15] == b"SQLite format 3":
-            rows = _rows_from_db_bytes(data)
-        else:
-            rows = _rows_from_csv(data.decode("utf-8", "replace"))
-            if not rows:
-                return False, "no egg rows found in file"
-    except Exception as e:
-        return False, f"could not read file: {e}"
-    valid = [(d, h) for d, h in rows if _DATE_RE.match(str(d)) and h in _HEN_IDS]
-    n = _fill_cache(valid)
-    # If Supabase is the store, push the restored rows so they persist there too.
-    if egg_backend() == "supabase":
-        for d, h in valid:
-            _egg_pending.append(("upsert", d, h))
-    print(f"[eggs] restored {n} eggs from upload")
-    return True, f"restored {n} eggs"
 
 
 def eggs_stats():
@@ -1581,20 +1485,20 @@ loadConfig();
 // ── door schedule ───────────────────────────────────────────────────────────
 function loadSchedule() {
   fetch('/schedule').then(function(r){ return r.json(); }).then(function(s){
-    document.getElementById('sch-open-en').checked  = !!s.open_enabled;
-    document.getElementById('sch-open-tm').value    = s.open_time  || '07:00';
-    document.getElementById('sch-close-en').checked = !!s.close_enabled;
-    document.getElementById('sch-close-tm').value   = s.close_time || '21:00';
+    document.getElementById('sch-open1-en').checked = !!s.open1_enabled;
+    document.getElementById('sch-open1-tm').value   = s.open1_time || '07:00';
+    document.getElementById('sch-open2-en').checked = !!s.open2_enabled;
+    document.getElementById('sch-open2-tm').value   = s.open2_time || '21:00';
   }).catch(function(){});
 }
 function saveSchedule() {
   var st = document.getElementById('sch-status');
   fetch('/schedule', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({
-      open_enabled:  document.getElementById('sch-open-en').checked,
-      open_time:     document.getElementById('sch-open-tm').value,
-      close_enabled: document.getElementById('sch-close-en').checked,
-      close_time:    document.getElementById('sch-close-tm').value
+      open1_enabled: document.getElementById('sch-open1-en').checked,
+      open1_time:    document.getElementById('sch-open1-tm').value,
+      open2_enabled: document.getElementById('sch-open2-en').checked,
+      open2_time:    document.getElementById('sch-open2-tm').value
     })})
   .then(function(r){ return r.json(); })
   .then(function(d){
@@ -1713,28 +1617,6 @@ function cell(txt, cls) {
   var d = document.createElement('div');
   d.className = cls; d.textContent = txt;
   return d;
-}
-function uploadEggs(input) {
-  var f = input.files && input.files[0];
-  if (!f) return;
-  if (!confirm('Replace the current egg log with "' + f.name + '"?')) {
-    input.value = ''; return;
-  }
-  var st = document.getElementById('egg-save-status');
-  st.textContent = 'Restoring\\u2026'; st.style.color = 'var(--muted)';
-  f.arrayBuffer().then(function(buf){
-    return fetch('/eggs/upload', {method:'POST',
-      headers:{'Content-Type':'application/octet-stream'}, body: buf});
-  })
-  .then(function(r){ return r.json(); })
-  .then(function(d){
-    st.textContent = d.ok ? (d.msg || 'Restored \\u2713') : (d.error || 'failed');
-    st.style.color = d.ok ? 'var(--green)' : 'var(--red)';
-    setTimeout(function(){ st.textContent = ''; }, 5000);
-    loadEggs();
-  })
-  .catch(function(){ st.textContent = 'Upload failed'; st.style.color = 'var(--red)'; })
-  .then(function(){ input.value = ''; });
 }
 function saveEggDb() {
   var st  = document.getElementById('egg-db-status');
@@ -1955,13 +1837,13 @@ def build_dashboard(cameras):
         '    <span class="ip-status" id="ip-status"></span>\n'
         '  </div>\n'
         '  <div class="sched-row">\n'
-        '    <span class="ip-label">Schedule</span>\n'
-        '    <label class="sw"><input type="checkbox" id="sch-open-en"/>'
-        '<span>Open at</span></label>\n'
-        '    <input class="tm" id="sch-open-tm" type="time" value="07:00"/>\n'
-        '    <label class="sw"><input type="checkbox" id="sch-close-en"/>'
-        '<span>Close at</span></label>\n'
-        '    <input class="tm" id="sch-close-tm" type="time" value="21:00"/>\n'
+        '    <span class="ip-label">Auto-open</span>\n'
+        '    <label class="sw"><input type="checkbox" id="sch-open1-en"/>'
+        '<span>at</span></label>\n'
+        '    <input class="tm" id="sch-open1-tm" type="time" value="07:00"/>\n'
+        '    <label class="sw"><input type="checkbox" id="sch-open2-en"/>'
+        '<span>and at</span></label>\n'
+        '    <input class="tm" id="sch-open2-tm" type="time" value="21:00"/>\n'
         '    <button class="ip-save" onclick="saveSchedule()">Save</button>\n'
         '    <span class="ip-status" id="sch-status"></span>\n'
         '  </div>\n'
@@ -1983,16 +1865,7 @@ def build_dashboard(cameras):
         '      <span class="egg-date" id="egg-today"></span>\n'
         '    </div>\n'
         '    <div class="egg-save">\n'
-        '      <a class="ip-save" href="/eggs/download" download>'
-        '&#11015; Save .db to this device</a>\n'
-        '      <a class="pc-btn pc-restart" href="/eggs/export.csv" download>'
-        '&#11015; CSV</a>\n'
-        '      <button class="pc-btn pc-restart" onclick="'
-        'document.getElementById(\'egg-file\').click()">&#11014; Restore</button>\n'
-        '      <input type="file" id="egg-file" accept=".db,.csv" style="display:none" '
-        'onchange="uploadEggs(this)"/>\n'
         '      <span class="egg-unsaved" id="egg-unsaved"></span>\n'
-        '      <span class="ip-status" id="egg-save-status"></span>\n'
         '    </div>\n'
         '    <div class="egg-today" id="egg-toggles"></div>\n'
         '    <div class="egg-grid-wrap"><div class="egg-grid" id="egg-grid"></div></div>\n'
@@ -2046,17 +1919,6 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _download(self, body, filename, ctype="application/octet-stream"):
-        """Send bytes as a browser download (saves to the viewer's machine)."""
-        if isinstance(body, str):
-            body = body.encode()
-        self.send_response(200)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -2157,14 +2019,6 @@ class Handler(BaseHTTPRequestHandler):
                              "online": _egg_online,
                              "pending": len(_egg_pending)})
 
-        elif path == "/eggs/download":
-            stamp = time.strftime("%Y-%m-%d")
-            self._download(eggs_db_bytes(), f"eggs-{stamp}.db")
-
-        elif path == "/eggs/export.csv":
-            stamp = time.strftime("%Y-%m-%d")
-            self._download(eggs_csv(), f"eggs-{stamp}.csv", "text/csv; charset=utf-8")
-
         elif path == "/actions":
             with _actions_lock:
                 self._json(200, {"actions": list(_actions)})
@@ -2180,20 +2034,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?")[0]
-        if path not in ("/motor", "/config", "/pipeline", "/schedule",
-                        "/eggs", "/eggs/upload"):
+        if path not in ("/motor", "/config", "/pipeline", "/schedule", "/eggs"):
             self.send_error(404)
             return
         length = int(self.headers.get("Content-Length", 0))
-
-        if path == "/eggs/upload":          # raw .db bytes, not JSON
-            if length <= 0 or length > 20 * 1024 * 1024:
-                self._json(400, {"ok": False, "error": "bad upload size"})
-                return
-            ok, msg = eggs_load_bytes(self.rfile.read(length))
-            self._json(200 if ok else 400,
-                       {"ok": ok, "msg" if ok else "error": msg})
-            return
 
         try:
             data = json.loads(self.rfile.read(length))
