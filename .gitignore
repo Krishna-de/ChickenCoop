@@ -12,3 +12,10 @@ env/
 Thumbs.db
 *.log
 config.local.py
+
+# runtime state — never commit (holds motor IP, schedule, Supabase key)
+dashboard_config.json
+temps.json
+eggs.db
+eggs.json
+*.tmp
