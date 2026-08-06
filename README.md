@@ -173,12 +173,76 @@ RGB and IR auto-assign to left/right slots on page load. IR stream is staggered 
 
 ## Motor API
 
-| Method | Endpoint | Body | Response |
+The motor Pi runs a plain HTTP server on **port 8081** — you can drive the door
+directly (curl, Postman, HTTPie, a script) without the dashboard. `up` = open,
+`down` = close, `stop` = force stop.
+
+Base URL: `http://<motor-pi-ip>:8081` (Tailscale IP works from anywhere on your tailnet).
+
+### Endpoints
+
+| Method | Endpoint | Body | Purpose |
 |---|---|---|---|
-| POST | `/motor` | `{"cmd": "up"}` | `{"ok": true, "state": "up"}` |
-| POST | `/motor` | `{"cmd": "down"}` | `{"ok": true, "state": "down"}` |
-| POST | `/motor` | `{"cmd": "stop"}` | `{"ok": true, "state": "stopped"}` |
-| GET | `/motor` | — | `{"state": "up"\|"down"\|"stopped"}` |
+| POST | `/motor` | `{"cmd":"up"}` | open the door |
+| POST | `/motor` | `{"cmd":"down"}` | close the door |
+| POST | `/motor` | `{"cmd":"stop"}` | force stop |
+| GET | `/motor` | — | full status (see below) |
+| GET | `/log` | — | `{"debug": false}` |
+| POST | `/log` | `{"debug":true}` | toggle verbose switch-edge logging |
+
+`GET /motor` returns:
+```json
+{
+  "state": "stopped",        // up | down | stopped  (motor motion)
+  "door": "bottom",          // top | bottom | partial  (from switches)
+  "door_state": "closed",    // open | closed | unknown  (open=at/last-from top)
+  "top": false,              // top limit switch active
+  "bottom": true,            // bottom limit switch active
+  "temp": 43.8,              // motor Pi CPU °C
+  "version": "1.7.1"
+}
+```
+
+### curl
+
+```bash
+MOTOR=http://100.x.x.x:8081        # motor Pi Tailscale/LAN IP
+
+# open / close / stop
+curl -sX POST $MOTOR/motor -H 'Content-Type: application/json' -d '{"cmd":"up"}'
+curl -sX POST $MOTOR/motor -H 'Content-Type: application/json' -d '{"cmd":"down"}'
+curl -sX POST $MOTOR/motor -H 'Content-Type: application/json' -d '{"cmd":"stop"}'
+
+# read status
+curl -s $MOTOR/motor | jq
+
+# turn debug logging on, watch, turn off
+curl -sX POST $MOTOR/log -H 'Content-Type: application/json' -d '{"debug":true}'
+journalctl -u motor-server -f          # on the motor Pi
+curl -sX POST $MOTOR/log -H 'Content-Type: application/json' -d '{"debug":false}'
+```
+
+### Postman
+
+1. **Method** `POST`, **URL** `http://<motor-pi-ip>:8081/motor`
+2. **Body** → *raw* → *JSON*: `{"cmd":"up"}`
+3. Send. (Header `Content-Type: application/json` is set automatically with raw-JSON.)
+4. For status use a `GET` to the same `/motor` URL, no body.
+
+> The server is plain HTTP with **no authentication** — anyone who can reach the
+> motor Pi's IP:8081 can move the door. Keep it on the Tailscale network (not
+> port-forwarded to the internet). The dashboard reaches it over the tailnet;
+> direct API calls should too.
+
+### Notes
+
+- The dashboard proxies motor calls through its own `/motor` at port 8080, but
+  the motor Pi's `8081` is directly reachable — either works.
+- Commands are **serialized** on the motor Pi: a new command smoothly
+  decelerates any current move, pauses, then drives the new direction.
+- A move **auto-stops at the limit switch** in its travel direction. `up` won't
+  drive into a pressed top switch; `down` won't drive into a pressed bottom.
+- `stop` is an immediate hard halt (emergency).
 
 ---
 

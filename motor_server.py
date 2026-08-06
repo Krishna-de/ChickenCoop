@@ -40,6 +40,10 @@ BOTTOM_PIN   = 6    # board pin 31 — stops DOWN travel
 #           broken wire reads as "triggered". This matches the current wiring.
 #   False = NO (normally-open): pin HIGH at rest, LOW at the limit.
 SWITCHES_NC  = False
+# Limit debounce: a limit is only believed if it reads active on this many
+# consecutive samples spaced LIMIT_GAP apart (rejects STEP/coil noise spikes).
+LIMIT_CONFIRM = 4
+LIMIT_GAP     = 0.003   # ~12ms total confirm window
 
 DELAY_START  = 0.012   # slowest step delay (start/end of a move)
 DELAY_MIN    = 0.003   # fastest step delay (cruise)
@@ -52,7 +56,7 @@ REVERSE_DWELL = 0.4    # seconds to pause after a decel before driving the other
 HOLD_OPEN    = False
 
 PORT         = 8081
-VERSION      = "1.7.1"
+VERSION      = "1.8.0"
 
 # ── motor state ───────────────────────────────────────────────────────────────
 stop_evt     = threading.Event()   # HARD stop (Force Stop / limit) — halt now
@@ -180,6 +184,18 @@ def _decelerate():
         step_once(DELAY_MIN + (DELAY_START - DELAY_MIN) * t)
 
 
+def _confirm(fn):
+    """Require the switch to stay active across several quick samples. Rejects
+    single-read glitches — the STEP line and coil currents couple noise onto the
+    switch inputs, which would otherwise trip a 'limit hit' the moment the motor
+    starts. A real limit stays pressed for the whole window."""
+    for _ in range(LIMIT_CONFIRM):
+        if not fn():
+            return False
+        time.sleep(LIMIT_GAP)
+    return True
+
+
 def run_continuous(cw):
     global state_label, last_limit
     GPIO.output(DIR_PIN, GPIO.HIGH if cw else GPIO.LOW)
@@ -189,6 +205,10 @@ def run_continuous(cw):
     i = 0
     while not stop_evt.is_set() and not soft_evt.is_set():
         if at_limit():
+            if not _confirm(at_limit):          # debounce: was it just noise?
+                if debug_enabled:
+                    log.info(f"{'TOP' if cw else 'BOTTOM'} read glitch, ignoring")
+                continue
             log.info(f"{'TOP' if cw else 'BOTTOM'} limit hit — stopping")
             last_limit = "top" if cw else "bottom"
             break
