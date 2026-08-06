@@ -71,7 +71,7 @@ def encode_jpeg(arr, gray, quality=80):
     return None
 
 # ── config ────────────────────────────────────────────────────────────────────
-VERSION     = "1.17.0"
+VERSION     = "1.18.0"
 PORT        = 8080
 FPS         = 10          # ffmpeg/UVC: lower FPS reduces USB bandwidth contention
 REALSENSE_FPS = 15        # Indoor camera. 15 is verified working on this D4xx;
@@ -1417,9 +1417,34 @@ function setErr(msg) {
     pil.className = 'pill pill-on'; pil.textContent = 'Motor Pi';
   }
 }
-// While a command POST is in flight, suppress the periodic /motor poll so the
-// two don't hit the motor relay at once. The command re-polls when it finishes.
-var motorBusy = false;
+// Polling model (keeps load on the motor Pi low):
+//   - idle: one heartbeat a minute, just to show door state + online status.
+//   - active: while the door is moving, poll fast — but ONLY from pressing a
+//     button until the motor reports "stopped" (reached its limit / halted).
+var MOTOR_IDLE_MS   = 60000;   // heartbeat when nothing is happening
+var MOTOR_ACTIVE_MS = 1500;    // while a move is in progress
+var MOTOR_ACTIVE_MAX = 40;     // safety: stop fast-polling after ~60s no matter what
+var motorBusy   = false;       // a command POST is in flight
+var activeTimer = null;
+var activeTicks = 0;
+
+function stopActivePolling() {
+  if (activeTimer) { clearInterval(activeTimer); activeTimer = null; }
+  activeTicks = 0;
+}
+function startActivePolling() {
+  if (activeTimer) return;
+  activeTicks = 0;
+  activeTimer = setInterval(function(){
+    activeTicks++;
+    pollMotor(function(d){
+      // Done once the motor is idle again (hit a limit or was stopped).
+      if (d && d.state === 'stopped') stopActivePolling();
+    });
+    if (activeTicks >= MOTOR_ACTIVE_MAX) stopActivePolling();
+  }, MOTOR_ACTIVE_MS);
+}
+
 function motorCmd(cmd) {
   if (motorBusy) return;              // one command at a time
   // Anti-spam: Open/Close are rate-limited so rapid clicks can't queue up
@@ -1435,28 +1460,32 @@ function motorCmd(cmd) {
   .then(function(r){ return r.json(); })
   .then(function(d){ if (d.ok) { setErr(null); } else { setErr(d.error||'error'); } })
   .catch(function(){ setErr('Network error'); })
-  .then(function(){ motorBusy = false; pollMotor(); loadActions(); });
+  .then(function(){
+    motorBusy = false;
+    loadActions();
+    if (cmd === 'stop') { pollMotor(); stopActivePolling(); }  // done, back to idle
+    else startActivePolling();                                 // watch it travel
+  });
 }
 // A single dropped/slow poll (network blip, Pi busy stepping) must not flap the
-// UI to "offline" — only give up after several consecutive misses, and keep
-// showing the last known door state until then.
+// UI to "offline" — only give up after several consecutive misses.
 var motorFails = 0;
-var MOTOR_FAIL_LIMIT = 3;          // 3 x 4s poll => ~12s before declaring offline
+var MOTOR_FAIL_LIMIT = 3;
 function motorMissed(msg) {
   motorFails++;
   if (motorFails >= MOTOR_FAIL_LIMIT) setErr(msg);
 }
-function pollMotor() {
+function pollMotor(cb) {
   if (motorBusy) return;             // a command is in flight — don't compete
   fetch('/motor')
   .then(function(r){ return r.json(); })
   .then(function(d){
-    if (d.state !== undefined){ motorFails = 0; renderDoor(d); setErr(null); }
+    if (d.state !== undefined){ motorFails = 0; renderDoor(d); setErr(null); if (cb) cb(d); }
     else { motorMissed(d.error || 'Motor Pi error'); }
   })
   .catch(function(){ motorMissed('Motor Pi unreachable'); });
 }
-setInterval(pollMotor, 4000);
+setInterval(pollMotor, MOTOR_IDLE_MS);   // slow heartbeat
 pollMotor();
 loadActions();
 
