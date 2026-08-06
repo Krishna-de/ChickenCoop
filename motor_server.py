@@ -11,20 +11,35 @@ Start: python3 motor_server.py
 Default port: 8081
 """
 
-import json, math, threading, time, sys, signal
+import json, math, threading, time, sys, signal, logging
 import RPi.GPIO as GPIO
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
+
+# ── logging ─────────────────────────────────────────────────────────────────
+# Baseline INFO logs are few (commands, limits, errors). The verbose switch-edge
+# trace is behind `debug_enabled`, toggled at runtime via POST /log — so after
+# diagnosing you turn it off and the motor Pi stops writing high-frequency logs
+# to disk. Default off.
+logging.basicConfig(stream=sys.stdout, level=logging.INFO,
+                    format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
+log = logging.getLogger("motor")
+debug_enabled = False
 
 # ── pin config ────────────────────────────────────────────────────────────────
 STEP_PIN     = 17
 DIR_PIN      = 27
 EN_PIN       = 22
 
-# End-switches (limit switches), COM-NO to GND, internal pull-up.
-# Triggered (door at that end) reads LOW.
+# End-switches (limit switches) with internal pull-up.
 TOP_PIN      = 5    # board pin 29 — stops UP travel
 BOTTOM_PIN   = 6    # board pin 31 — stops DOWN travel
+# How the switches are wired:
+#   True  = NC (normally-closed): contact closed at rest -> pin LOW when NOT at
+#           the limit, HIGH when the switch opens at the limit. Fail-safe: a
+#           broken wire reads as "triggered". This matches the current wiring.
+#   False = NO (normally-open): pin HIGH at rest, LOW at the limit.
+SWITCHES_NC  = True
 
 DELAY_START  = 0.012   # slowest step delay (start/end of a move)
 DELAY_MIN    = 0.003   # fastest step delay (cruise)
@@ -37,7 +52,7 @@ REVERSE_DWELL = 0.4    # seconds to pause after a decel before driving the other
 HOLD_OPEN    = False
 
 PORT         = 8081
-VERSION      = "1.5.0"
+VERSION      = "1.7.0"
 
 # ── motor state ───────────────────────────────────────────────────────────────
 stop_evt     = threading.Event()   # HARD stop (Force Stop / limit) — halt now
@@ -68,12 +83,38 @@ def setup():
     GPIO.setup(BOTTOM_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
 
+def _switch_active(pin):
+    # NC: actuated when the contact OPENS -> pin pulled HIGH.
+    # NO: actuated when the contact CLOSES to GND -> pin LOW.
+    level = GPIO.input(pin)
+    return level == (GPIO.HIGH if SWITCHES_NC else GPIO.LOW)
+
+
 def top_hit():
-    return GPIO.input(TOP_PIN) == GPIO.LOW
+    return _switch_active(TOP_PIN)
 
 
 def bottom_hit():
-    return GPIO.input(BOTTOM_PIN) == GPIO.LOW
+    return _switch_active(BOTTOM_PIN)
+
+
+def _watch_switches():
+    """Log every switch edge with RAW level vs interpreted state — the trace that
+    makes wiring problems (NC/NO, shorts, floats) obvious. Only runs while
+    debug_enabled is set: when off it does no GPIO reads and no logging at all."""
+    prev = None
+    while True:
+        if not debug_enabled:
+            prev = None
+            time.sleep(0.5)          # idle: no reads, no writes
+            continue
+        cur = (GPIO.input(TOP_PIN), GPIO.input(BOTTOM_PIN))
+        if cur != prev:
+            log.info("switch edge: TOP raw=%s active=%s | BOTTOM raw=%s active=%s | door=%s",
+                     "HI" if cur[0] else "LO", top_hit(),
+                     "HI" if cur[1] else "LO", bottom_hit(), door_position())
+            prev = cur
+        time.sleep(0.05)             # 20 Hz while debugging
 
 
 last_limit = None   # "top" | "bottom" | None — which end-switch was last seen closed
@@ -148,7 +189,7 @@ def run_continuous(cw):
     i = 0
     while not stop_evt.is_set() and not soft_evt.is_set():
         if at_limit():
-            print(f"[motor] {'TOP' if cw else 'BOTTOM'} limit hit — stopping")
+            log.info(f"{'TOP' if cw else 'BOTTOM'} limit hit — stopping")
             last_limit = "top" if cw else "bottom"
             break
         step_once(_ramp_delay(i))
@@ -160,12 +201,12 @@ def run_continuous(cw):
     # Default off: the door slips a small, self-limiting amount and the software
     # tracks it via last_limit, so no continuous holding current is needed.
     if HOLD_OPEN and not bottom_hit():
-        print("[motor] holding position (coils energized)")
+        log.info("holding position (coils energized)")
     else:
         disable()
     with state_lock:
         state_label = "stopped"
-    print("[motor] stepping thread exited")
+    log.info("stepping thread exited")
 
 
 def _hard_stop_locked():
@@ -201,11 +242,11 @@ def start_motor(cw=True):
     if target_hit and not both:
         with cmd_lock:
             _hard_stop_locked()
-        print(f"[motor] already at {'TOP' if cw else 'BOTTOM'} limit; not moving")
+        log.info(f"already at {'TOP' if cw else 'BOTTOM'} limit; not moving")
         return
     with cmd_lock:
         if motor_thread and motor_thread.is_alive() and current_dir == cw:
-            print("[motor] already moving that way; ignoring")
+            log.info("already moving that way; ignoring")
             return
         reversing = motor_thread and motor_thread.is_alive()
         _soft_stop_locked()            # decelerate any current motion smoothly
@@ -218,21 +259,21 @@ def start_motor(cw=True):
             state_label = "up" if cw else "down"
         motor_thread = threading.Thread(target=run_continuous, args=(cw,), daemon=True)
         motor_thread.start()
-    print(f"[motor] start {'UP (CW)' if cw else 'DOWN (CCW)'}")
+    log.info(f"start {'UP (CW)' if cw else 'DOWN (CCW)'}")
 
 
 def stop_motor():
     """Force Stop — immediate hard halt."""
     with cmd_lock:
         _hard_stop_locked()
-    print("[motor] force stop")
+    log.info("force stop")
 
 
 def shutdown(sig=None, frame=None):
     stop_motor()
     disable()
     GPIO.cleanup()
-    print("[motor] shutdown")
+    log.info("shutdown")
     sys.exit(0)
 
 
@@ -263,17 +304,21 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        if self.path.split("?")[0] == "/motor":
+        path = self.path.split("?")[0]
+        if path == "/motor":
             with state_lock:
                 st = state_label
             self._json(200, {"state": st, "version": VERSION, "temp": read_temp(),
                              "door": door_position(), "door_state": door_state(),
                              "top": top_hit(), "bottom": bottom_hit()})
+        elif path == "/log":
+            self._json(200, {"debug": debug_enabled})
         else:
             self._json(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path.split("?")[0] != "/motor":
+        path = self.path.split("?")[0]
+        if path not in ("/motor", "/log"):
             self._json(404, {"error": "not found"})
             return
         length = int(self.headers.get("Content-Length", 0))
@@ -282,8 +327,16 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             self._json(400, {"error": "bad json"})
             return
+
+        if path == "/log":
+            global debug_enabled
+            debug_enabled = bool(data.get("debug"))
+            log.info(f"debug logging {'ON' if debug_enabled else 'OFF'}")
+            self._json(200, {"ok": True, "debug": debug_enabled})
+            return
+
         cmd = data.get("cmd", "")
-        print(f"[motor] POST cmd={cmd!r} from {self.client_address[0]}")
+        log.info(f"POST cmd={cmd!r} from {self.client_address[0]}")
         if cmd == "up":
             start_motor(cw=True)
         elif cmd == "down":
@@ -301,6 +354,7 @@ if __name__ == "__main__":
     setup()
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT,  shutdown)
+    threading.Thread(target=_watch_switches, daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"[motor_server] v{VERSION} listening on port {PORT}")
+    log.info(f"v{VERSION} listening on port {PORT}  (POST /log to toggle debug)")
     server.serve_forever()

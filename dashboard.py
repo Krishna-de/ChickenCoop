@@ -71,7 +71,7 @@ def encode_jpeg(arr, gray, quality=80):
     return None
 
 # ── config ────────────────────────────────────────────────────────────────────
-VERSION     = "1.15.0"
+VERSION     = "1.16.0"
 PORT        = 8080
 FPS         = 10          # ffmpeg/UVC: lower FPS reduces USB bandwidth contention
 REALSENSE_FPS = 15        # Indoor camera. 15 is verified working on this D4xx;
@@ -1421,7 +1421,11 @@ function setErr(msg) {
     pil.className = 'pill pill-on'; pil.textContent = 'Motor Pi';
   }
 }
+// While a command POST is in flight, suppress the periodic /motor poll so the
+// two don't hit the motor relay at once. The command re-polls when it finishes.
+var motorBusy = false;
 function motorCmd(cmd) {
+  if (motorBusy) return;              // one command at a time
   // Anti-spam: Open/Close are rate-limited so rapid clicks can't queue up
   // reversals. Force Stop always goes through.
   if (cmd !== 'stop') {
@@ -1429,12 +1433,13 @@ function motorCmd(cmd) {
     cmdCooldown = true; updateButtons();
     setTimeout(function(){ cmdCooldown = false; updateButtons(); }, CMD_COOLDOWN_MS);
   }
+  motorBusy = true;
   fetch('/motor', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({cmd: cmd})})
   .then(function(r){ return r.json(); })
-  .then(function(d){ if (d.ok) { setErr(null); pollMotor(); } else { setErr(d.error||'error'); } })
+  .then(function(d){ if (d.ok) { setErr(null); } else { setErr(d.error||'error'); } })
   .catch(function(){ setErr('Network error'); })
-  .then(function(){ loadActions(); });
+  .then(function(){ motorBusy = false; pollMotor(); loadActions(); });
 }
 // A single dropped/slow poll (network blip, Pi busy stepping) must not flap the
 // UI to "offline" — only give up after several consecutive misses, and keep
@@ -1446,6 +1451,7 @@ function motorMissed(msg) {
   if (motorFails >= MOTOR_FAIL_LIMIT) setErr(msg);
 }
 function pollMotor() {
+  if (motorBusy) return;             // a command is in flight — don't compete
   fetch('/motor')
   .then(function(r){ return r.json(); })
   .then(function(d){
