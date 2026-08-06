@@ -39,7 +39,7 @@ BOTTOM_PIN   = 6    # board pin 31 — stops DOWN travel
 #           the limit, HIGH when the switch opens at the limit. Fail-safe: a
 #           broken wire reads as "triggered". This matches the current wiring.
 #   False = NO (normally-open): pin HIGH at rest, LOW at the limit.
-SWITCHES_NC  = True
+SWITCHES_NC  = False
 
 DELAY_START  = 0.012   # slowest step delay (start/end of a move)
 DELAY_MIN    = 0.003   # fastest step delay (cruise)
@@ -52,7 +52,7 @@ REVERSE_DWELL = 0.4    # seconds to pause after a decel before driving the other
 HOLD_OPEN    = False
 
 PORT         = 8081
-VERSION      = "1.7.0"
+VERSION      = "1.7.1"
 
 # ── motor state ───────────────────────────────────────────────────────────────
 stop_evt     = threading.Event()   # HARD stop (Force Stop / limit) — halt now
