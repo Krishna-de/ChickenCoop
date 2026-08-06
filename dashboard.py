@@ -71,7 +71,7 @@ def encode_jpeg(arr, gray, quality=80):
     return None
 
 # ── config ────────────────────────────────────────────────────────────────────
-VERSION     = "1.14.0"
+VERSION     = "1.15.0"
 PORT        = 8080
 FPS         = 10          # ffmpeg/UVC: lower FPS reduces USB bandwidth contention
 REALSENSE_FPS = 15        # Indoor camera. 15 is verified working on this D4xx;
@@ -1357,12 +1357,16 @@ var lastStatus  = null;
 var cmdCooldown = false;
 var CMD_COOLDOWN_MS = 1500;   // covers the motor's decel + reverse dwell
 
-// Buttons are disabled by EITHER a limit switch or the anti-spam cooldown,
-// so both inputs must be re-applied together whenever either changes.
+// Button rule: only the switch at that end disables its button. If NEITHER
+// switch is active (door mid-travel or slipped off a limit), BOTH buttons are
+// enabled so you can always drive it. If BOTH read active (sensor fault), don't
+// lock the user out — enable both. The anti-spam cooldown disables both briefly.
 function updateButtons() {
   var d = lastStatus || {};
-  document.getElementById('btn-up').disabled   = !!d.top || cmdCooldown;
-  document.getElementById('btn-down').disabled = !!d.bottom || cmdCooldown;
+  var top = d.top === true, bottom = d.bottom === true;
+  var fault = top && bottom;                 // impossible in reality -> ignore switches
+  document.getElementById('btn-up').disabled   = cmdCooldown || (top && !fault);
+  document.getElementById('btn-down').disabled = cmdCooldown || (bottom && !fault);
   // Force Stop is never disabled — it's the emergency path.
 }
 function renderDoor(d) {

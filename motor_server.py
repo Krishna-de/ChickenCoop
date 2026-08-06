@@ -30,9 +30,14 @@ DELAY_START  = 0.012   # slowest step delay (start/end of a move)
 DELAY_MIN    = 0.003   # fastest step delay (cruise)
 RAMP_STEPS   = 30      # accel/decel ramp length
 REVERSE_DWELL = 0.4    # seconds to pause after a decel before driving the other way
+# The motor has no brake. When it stops off the bottom, gravity pulls the door
+# down a little. If that slip is small and self-limiting (~cm) leave this False —
+# coils release, no heat/power. Set True to keep the coils energized as a holding
+# brake (prevents any slip, but draws motor current continuously = heat).
+HOLD_OPEN    = False
 
 PORT         = 8081
-VERSION      = "1.4.0"
+VERSION      = "1.5.0"
 
 # ── motor state ───────────────────────────────────────────────────────────────
 stop_evt     = threading.Event()   # HARD stop (Force Stop / limit) — halt now
@@ -151,7 +156,13 @@ def run_continuous(cw):
     # Smoothly decelerate on a soft stop; hard stop and limits halt immediately.
     if soft_evt.is_set() and not stop_evt.is_set():
         _decelerate()
-    disable()
+    # HOLD_OPEN keeps the coils energized off the bottom as a holding brake.
+    # Default off: the door slips a small, self-limiting amount and the software
+    # tracks it via last_limit, so no continuous holding current is needed.
+    if HOLD_OPEN and not bottom_hit():
+        print("[motor] holding position (coils energized)")
+    else:
+        disable()
     with state_lock:
         state_label = "stopped"
     print("[motor] stepping thread exited")
@@ -182,8 +193,12 @@ def _soft_stop_locked():
 
 def start_motor(cw=True):
     global motor_thread, state_label, current_dir
-    # Already sitting on the limit we'd drive into? Don't move.
-    if (cw and top_hit()) or (not cw and bottom_hit()):
+    # Refuse to drive INTO a pressed limit — but only when that switch alone is
+    # active. If both read active it's a sensor fault, so don't lock the door up;
+    # allow the move and let run_continuous stop at the real limit.
+    both = top_hit() and bottom_hit()
+    target_hit = top_hit() if cw else bottom_hit()
+    if target_hit and not both:
         with cmd_lock:
             _hard_stop_locked()
         print(f"[motor] already at {'TOP' if cw else 'BOTTOM'} limit; not moving")
