@@ -71,7 +71,7 @@ def encode_jpeg(arr, gray, quality=80):
     return None
 
 # ── config ────────────────────────────────────────────────────────────────────
-VERSION     = "1.18.0"
+VERSION     = "1.19.0"
 PORT        = 8080
 FPS         = 10          # ffmpeg/UVC: lower FPS reduces USB bandwidth contention
 REALSENSE_FPS = 15        # Indoor camera. 15 is verified working on this D4xx;
@@ -263,16 +263,18 @@ class CameraStream:
 
     def _build_cmd(self, w, h):
         """Build the ffmpeg command list for this stream kind."""
-        base = ["ffmpeg", "-loglevel", "error", "-f", "v4l2",
-                "-framerate", str(FPS),
-                "-video_size", f"{w}x{h}"]
+        base = ["ffmpeg", "-loglevel", "error", "-f", "v4l2"]
         if self.passthrough:
             # Ask the camera for MJPEG and copy it straight through: no decode,
-            # no encode, near-zero CPU.
-            return base + ["-input_format", "mjpeg", "-i", self.device,
+            # no encode, near-zero CPU. Don't force a framerate — many UVC cams
+            # (like this one) advertise only a single rate for MJPEG and reject
+            # anything else; let ffmpeg negotiate the camera's native rate.
+            return base + ["-video_size", f"{w}x{h}",
+                           "-input_format", "mjpeg", "-i", self.device,
                            "-c:v", "copy", "-f", "mjpeg", "pipe:1"]
         # Fallback: camera can't do MJPEG, so we must transcode (expensive).
-        return base + ["-i", self.device,
+        return base + ["-framerate", str(FPS), "-video_size", f"{w}x{h}",
+                       "-i", self.device,
                        "-c:v", "mjpeg", "-q:v", str(MJPEG_QSCALE),
                        "-f", "mjpeg", "pipe:1"]
 

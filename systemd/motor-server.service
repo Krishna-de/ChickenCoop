@@ -11,6 +11,10 @@ Restart=always
 RestartSec=5
 # flush print() straight to the journal (no buffering)
 Environment=PYTHONUNBUFFERED=1
+# Optional Telegram push: create __DIR__/telegram.env (gitignored) with
+#   TELEGRAM_TOKEN=...   TELEGRAM_CHAT_ID=...
+# The leading '-' makes it optional — service still starts if the file is absent.
+EnvironmentFile=-__DIR__/telegram.env
 
 [Install]
 WantedBy=multi-user.target

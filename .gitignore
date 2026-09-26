@@ -19,3 +19,6 @@ temps.json
 eggs.db
 eggs.json
 *.tmp
+
+# Telegram bot secret — never commit
+telegram.env

@@ -11,7 +11,8 @@ Start: python3 motor_server.py
 Default port: 8081
 """
 
-import json, math, threading, time, sys, signal, logging
+import json, math, threading, time, sys, signal, logging, os
+import urllib.request, urllib.parse
 import RPi.GPIO as GPIO
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
@@ -25,6 +26,27 @@ logging.basicConfig(stream=sys.stdout, level=logging.INFO,
                     format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("motor")
 debug_enabled = False
+
+# ── Telegram push (optional) ──────────────────────────────────────────────────
+# Set TELEGRAM_TOKEN + TELEGRAM_CHAT_ID in the environment (see telegram.env,
+# loaded by the systemd unit — kept out of git). Empty = notifications off.
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+
+
+def notify(text):
+    """Fire-and-forget Telegram message. Never blocks or breaks motor control."""
+    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT):
+        return
+    def worker():
+        try:
+            url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            data = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT,
+                                           "text": text}).encode()
+            urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=5).read()
+        except Exception as e:
+            log.info(f"telegram notify failed: {e}")
+    threading.Thread(target=worker, daemon=True).start()
 
 # ── pin config ────────────────────────────────────────────────────────────────
 STEP_PIN     = 17
@@ -49,6 +71,9 @@ DELAY_START  = 0.012   # slowest step delay (start/end of a move)
 DELAY_MIN    = 0.003   # fastest step delay (cruise)
 RAMP_STEPS   = 30      # accel/decel ramp length
 REVERSE_DWELL = 0.4    # seconds to pause after a decel before driving the other way
+# Guard rail: max time a single open/close may run before we assume a jam and
+# stop + alert. Set well above real travel time (~10s) — measure yours and pad.
+MAX_TRAVEL_SEC = 25
 # The motor has no brake. When it stops off the bottom, gravity pulls the door
 # down a little. If that slip is small and self-limiting (~cm) leave this False —
 # coils release, no heat/power. Set True to keep the coils energized as a holding
@@ -56,7 +81,7 @@ REVERSE_DWELL = 0.4    # seconds to pause after a decel before driving the other
 HOLD_OPEN    = False
 
 PORT         = 8081
-VERSION      = "1.8.0"
+VERSION      = "1.10.0"
 
 # ── motor state ───────────────────────────────────────────────────────────────
 stop_evt     = threading.Event()   # HARD stop (Force Stop / limit) — halt now
@@ -184,13 +209,13 @@ def _decelerate():
         step_once(DELAY_MIN + (DELAY_START - DELAY_MIN) * t)
 
 
-def _confirm(fn):
-    """Require the switch to stay active across several quick samples. Rejects
-    single-read glitches — the STEP line and coil currents couple noise onto the
-    switch inputs, which would otherwise trip a 'limit hit' the moment the motor
-    starts. A real limit stays pressed for the whole window."""
+def _limit_reached(target_fn, other_fn):
+    """A limit is real only if the target switch stays active AND the OTHER one
+    stays inactive across the whole window. Motor coil current shifts the switch
+    ground and pulls BOTH inputs low at once — but the door can't be at both ends,
+    so 'both active' is always noise and is rejected here."""
     for _ in range(LIMIT_CONFIRM):
-        if not fn():
+        if not target_fn() or other_fn():
             return False
         time.sleep(LIMIT_GAP)
     return True
@@ -202,25 +227,38 @@ def run_continuous(cw):
     enable()
     # Only the limit in the travel direction stops us: UP -> TOP, DOWN -> BOTTOM.
     at_limit = top_hit if cw else bottom_hit
+    other    = bottom_hit if cw else top_hit
+    started  = time.monotonic()
+    jammed   = False
     i = 0
     while not stop_evt.is_set() and not soft_evt.is_set():
+        # Guard rail: a real move takes a known time. If we blow past the max
+        # without reaching the limit, something is wrong (rope slipped, jam,
+        # dead switch) — stop pushing and alert, don't grind forever.
+        if time.monotonic() - started > MAX_TRAVEL_SEC:
+            jammed = True
+            log.info(f"travel timeout after {MAX_TRAVEL_SEC}s — no limit, stopping")
+            break
         if at_limit():
-            if not _confirm(at_limit):          # debounce: was it just noise?
+            if not _limit_reached(at_limit, other):   # reject noise / both-active
                 if debug_enabled:
-                    log.info(f"{'TOP' if cw else 'BOTTOM'} read glitch, ignoring")
+                    log.info(f"{'TOP' if cw else 'BOTTOM'} read rejected (noise/both-active)")
                 continue
             log.info(f"{'TOP' if cw else 'BOTTOM'} limit hit — stopping")
             last_limit = "top" if cw else "bottom"
+            notify("✅ Coop door OPEN" if cw else "✅ Coop door CLOSED")
             break
         step_once(_ramp_delay(i))
         i += 1
-    # Smoothly decelerate on a soft stop; hard stop and limits halt immediately.
+    # Smoothly decelerate on a soft stop; hard stop / limit / jam halt immediately.
     if soft_evt.is_set() and not stop_evt.is_set():
         _decelerate()
-    # HOLD_OPEN keeps the coils energized off the bottom as a holding brake.
-    # Default off: the door slips a small, self-limiting amount and the software
-    # tracks it via last_limit, so no continuous holding current is needed.
-    if HOLD_OPEN and not bottom_hit():
+    # On a jam, always cut the coils (don't hold against an obstruction) and warn.
+    if jammed:
+        disable()
+        notify(f"⚠️ Coop door JAMMED — {'opening' if cw else 'closing'} "
+               f"exceeded {MAX_TRAVEL_SEC}s, stopped (check the door)")
+    elif HOLD_OPEN and not bottom_hit():
         log.info("holding position (coils energized)")
     else:
         disable()
@@ -280,17 +318,20 @@ def start_motor(cw=True):
         motor_thread = threading.Thread(target=run_continuous, args=(cw,), daemon=True)
         motor_thread.start()
     log.info(f"start {'UP (CW)' if cw else 'DOWN (CCW)'}")
+    notify("🔓 Coop door opening…" if cw else "🔒 Coop door closing…")
 
 
-def stop_motor():
+def stop_motor(notify_user=True):
     """Force Stop — immediate hard halt."""
     with cmd_lock:
         _hard_stop_locked()
     log.info("force stop")
+    if notify_user:
+        notify("⏹ Coop door force-stopped")
 
 
 def shutdown(sig=None, frame=None):
-    stop_motor()
+    stop_motor(notify_user=False)      # don't ping on a service restart
     disable()
     GPIO.cleanup()
     log.info("shutdown")

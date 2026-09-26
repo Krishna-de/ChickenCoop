@@ -313,6 +313,56 @@ sudo systemctl restart coop-dashboard
 
 ---
 
+## Telegram notifications
+
+The motor Pi pushes door events (opening/closing, open/closed, force-stop, jam) to
+Telegram. Needs `TELEGRAM_TOKEN` + `TELEGRAM_CHAT_ID` in `telegram.env`, which the
+systemd unit loads. Empty/absent = notifications off.
+
+### Set up the bot
+1. Telegram → **@BotFather** → `/newbot` → copy the **token**.
+2. Open your bot, press **Start**, send it any message.
+3. Message **@userinfobot** → it replies with your numeric **chat ID**.
+
+### Encrypted secret in git (pull-and-run)
+
+The token is a secret, so the plaintext `telegram.env` is **gitignored**. To carry it
+via GitHub, commit only an **AES-256 encrypted** copy (`telegram.env.enc`) and decrypt
+on the Pi. The passphrase is never stored — you type it. Uses `openssl` (already
+present; no install).
+
+**Create + encrypt (once, on any trusted machine):**
+```bash
+cat > telegram.env <<'EOF'
+TELEGRAM_TOKEN=123456:your-new-token
+TELEGRAM_CHAT_ID=987654321
+EOF
+./telegram-secret.sh encrypt        # prompts a passphrase -> telegram.env.enc
+git add telegram.env.enc && git commit -m "add encrypted telegram secret" && git push
+```
+
+**On the motor Pi (pull + decrypt + run):**
+```bash
+cd ~/ChickenCoop && git pull
+./telegram-secret.sh decrypt        # enter the same passphrase -> telegram.env
+sudo bash install.sh motor          # unit loads telegram.env, restarts
+```
+
+- Only `telegram.env.enc` (ciphertext) is committed; `telegram.env` (plaintext) is ignored.
+- Safe in a public repo **only** with a strong passphrase. If the token ever leaks,
+  `/revoke` in BotFather and re-encrypt the new one.
+- Prefer zero secrets in git at all? Skip the encrypt step and just create
+  `telegram.env` directly on the Pi (see above) — the app reads it the same way.
+
+### Test
+```bash
+cd ~/ChickenCoop && source telegram.env
+curl -s "https://api.telegram.org/bot$TELEGRAM_TOKEN/sendMessage" \
+  -d chat_id=$TELEGRAM_CHAT_ID -d text="coop online"
+```
+
+---
+
 ## Troubleshooting
 
 **IR stream blank** — try increasing `IR_START_DELAY = 3.0` in `dashboard.py`
