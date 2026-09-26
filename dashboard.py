@@ -72,7 +72,7 @@ def encode_jpeg(arr, gray, quality=80):
     return None
 
 # ── config ────────────────────────────────────────────────────────────────────
-VERSION     = "1.20.0"
+VERSION     = "1.21.0"
 PORT        = 8080
 FPS         = 10          # ffmpeg/UVC: lower FPS reduces USB bandwidth contention
 REALSENSE_FPS = 15        # Indoor camera. 15 is verified working on this D4xx;
@@ -662,44 +662,129 @@ def motor_get():
         return False, str(e)
 
 
-# ── Telegram push (optional) ──────────────────────────────────────────────────
-# Runs on the CAMERA Pi so it fires for manual AND scheduled commands, even with
-# no browser open. Set TELEGRAM_TOKEN + TELEGRAM_CHAT_ID in the environment
-# (telegram.env, loaded by the systemd unit). Empty = off.
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
-TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+# ── Telegram bot (optional, two-way) ──────────────────────────────────────────
+# Runs on the CAMERA Pi. Pushes door events AND accepts commands (open/close/
+# stop/status) — but ONLY from the configured chat id. Uses long-polling, so no
+# public URL/webhook is needed (works behind Tailscale). Tracked messages (its
+# own + received commands) are auto-deleted after TELEGRAM_RETENTION_H hours.
+# Set TELEGRAM_TOKEN + TELEGRAM_CHAT_ID in telegram.env. Empty = off.
+TELEGRAM_TOKEN      = os.environ.get("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT       = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_RETENTION_H = 48                 # delete tracked messages older than this
+APP_JAM_SEC = 20                          # camera-Pi guard: STOP a move that runs
+                                          # longer than this without hitting a limit
 _track_lock = threading.Lock()
 _track_id   = 0
+_tg_msgs    = deque(maxlen=2000)          # [(message_id, epoch), ...] for cleanup
+_tg_lock    = threading.Lock()
+
+
+def _tg_configured():
+    return bool(TELEGRAM_TOKEN and TELEGRAM_CHAT)
+
+
+def _tg_api(method, params, timeout=10):
+    url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
+    data = urllib.parse.urlencode(params).encode()
+    with urlopen(Request(url, data=data), timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def _tg_track(msg_id):
+    if msg_id:
+        with _tg_lock:
+            _tg_msgs.append((msg_id, time.time()))
 
 
 def notify(text):
-    """Fire-and-forget Telegram message. Never blocks the caller."""
-    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT):
+    """Fire-and-forget Telegram message; records the id for later cleanup."""
+    if not _tg_configured():
         return
     def worker():
         try:
-            url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            data = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT, "text": text}).encode()
-            urlopen(Request(url, data=data), timeout=5).read()
+            resp = _tg_api("sendMessage", {"chat_id": TELEGRAM_CHAT, "text": text})
+            if resp.get("ok"):
+                _tg_track(resp["result"]["message_id"])
         except Exception as e:
             print(f"[telegram] notify failed: {e}")
     threading.Thread(target=worker, daemon=True).start()
 
 
+def _tg_handle(text):
+    """Execute a command received over Telegram (already authorised)."""
+    cmd = text.strip().lower().lstrip("/").split()[0] if text.strip() else ""
+    if cmd in ("open", "up"):
+        ok, _ = motor_post("up");   log_action("telegram:open", ok, _);  on_motor_command("up", ok)
+    elif cmd in ("close", "down"):
+        ok, _ = motor_post("down"); log_action("telegram:close", ok, _); on_motor_command("down", ok)
+    elif cmd in ("stop",):
+        ok, _ = motor_post("stop"); log_action("telegram:stop", ok, _);  on_motor_command("stop", ok)
+    elif cmd in ("status", "state"):
+        ok, st = motor_get()
+        if ok and isinstance(st, dict):
+            notify(f"🚪 door: {st.get('door_state','?')} | motor: {st.get('state','?')} "
+                   f"| top={st.get('top')} bottom={st.get('bottom')} | {st.get('temp','?')}°C")
+        else:
+            notify("⚠️ motor Pi unreachable")
+    else:
+        notify("Commands: open, close, stop, status")
+
+
+def _tg_poll():
+    """Long-poll getUpdates for commands. Only the configured chat is obeyed."""
+    print("[telegram] command polling started")
+    offset = 0
+    while True:
+        try:
+            resp = _tg_api("getUpdates", {"offset": offset, "timeout": 30}, timeout=35)
+            for up in resp.get("result", []):
+                offset = up["update_id"] + 1
+                msg  = up.get("message") or up.get("edited_message") or {}
+                chat = str(msg.get("chat", {}).get("id", ""))
+                text = msg.get("text") or ""
+                _tg_track(msg.get("message_id"))
+                if chat != TELEGRAM_CHAT:      # ignore everyone else — silently
+                    continue
+                _tg_handle(text)
+        except Exception as e:
+            print(f"[telegram] poll error: {e}")
+            time.sleep(5)
+
+
+def _tg_cleanup():
+    """Delete tracked messages older than the retention window."""
+    while True:
+        time.sleep(1800)                   # every 30 min
+        cutoff = time.time() - TELEGRAM_RETENTION_H * 3600
+        with _tg_lock:
+            due  = [(m, t) for (m, t) in _tg_msgs if t < cutoff]
+        for mid, _ in due:
+            try:
+                _tg_api("deleteMessage", {"chat_id": TELEGRAM_CHAT, "message_id": mid})
+            except Exception:
+                pass                        # already gone / too old — drop it
+            with _tg_lock:
+                try:
+                    _tg_msgs.remove((mid, _))
+                except ValueError:
+                    pass
+
+
 def _track_completion(expect):
-    """Poll the motor until it stops, then report the outcome. `expect` is the
-    door_state we should end in ('open' / 'closed'); anything else = didn't reach
-    the limit (jam / stopped early)."""
+    """Watch a move to completion AND enforce an app-level jam guard: if the door
+    is still moving after APP_JAM_SEC, send STOP over the API. This is a guard
+    rail the CAMERA Pi enforces via HTTP — it works even when the motor Pi's own
+    firmware can't be updated. `expect` = the door_state a good move ends in."""
     global _track_id
     with _track_lock:
         _track_id += 1
         tid = _track_id
     def worker():
         t0 = time.time()
-        while time.time() - t0 < 45:
+        while time.time() - t0 < APP_JAM_SEC + 10:
             time.sleep(1.5)
             with _track_lock:
-                if tid != _track_id:      # a newer command superseded this one
+                if tid != _track_id:            # superseded by a newer command
                     return
             ok, st = motor_get()
             if not ok or not isinstance(st, dict):
@@ -710,9 +795,16 @@ def _track_completion(expect):
                     notify("✅ Coop door OPEN" if expect == "open" else "✅ Coop door CLOSED")
                 else:
                     end = "top" if expect == "open" else "bottom"
-                    notify(f"⚠️ Coop door did not reach {end} (state: {ds}) — check it")
+                    notify(f"⚠️ Coop door stopped without reaching {end} (state: {ds}) — check it")
                 return
-        notify("⚠️ Coop door move timed out — check it")
+            # Guard rail: still moving past the limit → force stop.
+            if time.time() - t0 > APP_JAM_SEC:
+                motor_post("stop")
+                with _track_lock:
+                    _track_id += 1              # cancel self (we issued the stop)
+                notify(f"⛔ Jam guard: door ran >{APP_JAM_SEC}s without reaching its "
+                       f"limit — sent STOP. Check the door.")
+                return
     threading.Thread(target=worker, daemon=True).start()
 
 
@@ -2255,6 +2347,10 @@ if __name__ == "__main__":
     threading.Thread(target=_temp_sampler, daemon=True).start()
     threading.Thread(target=_scheduler, daemon=True).start()
     threading.Thread(target=_egg_sync, daemon=True).start()
+    if _tg_configured():
+        threading.Thread(target=_tg_poll, daemon=True).start()
+        threading.Thread(target=_tg_cleanup, daemon=True).start()
+        print("[telegram] enabled")
     cams = get_cameras(force=True)     # warm the cache while the device is idle
     print(f"[dashboard] cameras: {[c['name'] for c in cams] or 'none'}")
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
