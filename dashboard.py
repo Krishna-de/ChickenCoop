@@ -72,7 +72,7 @@ def encode_jpeg(arr, gray, quality=80):
     return None
 
 # ── config ────────────────────────────────────────────────────────────────────
-VERSION     = "1.21.0"
+VERSION     = "1.22.0"
 PORT        = 8080
 FPS         = 10          # ffmpeg/UVC: lower FPS reduces USB bandwidth contention
 REALSENSE_FPS = 15        # Indoor camera. 15 is verified working on this D4xx;
@@ -512,6 +512,8 @@ _config = {
     # Empty = keep eggs in memory only (download to back up).
     "supabase_url": "",
     "supabase_key": "",
+    "jam_sec": 60,            # app-level guard: STOP a move that runs this long
+                             # without reaching a limit (10–300s)
     "schedule": {
         "open1_enabled": True,  "open1_time": "07:00",
         "open2_enabled": True,  "open2_time": "21:00",
@@ -549,6 +551,11 @@ def _load_config():
         for k in ("supabase_url", "supabase_key"):
             if isinstance(data.get(k), str):
                 _config[k] = data[k].strip()
+        try:
+            js = int(data.get("jam_sec"))
+            _config["jam_sec"] = max(10, min(js, 300))
+        except (TypeError, ValueError):
+            pass
         sch = data.get("schedule")
         if isinstance(sch, dict):
             for k in ("open1_enabled", "open2_enabled"):
@@ -569,6 +576,28 @@ def get_motor_ip():
 def get_schedule():
     with _config_lock:
         return dict(_config["schedule"])
+
+
+def get_jam_sec():
+    with _config_lock:
+        return _config["jam_sec"]
+
+
+def set_jam_sec(v):
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        return False, "jam seconds must be a number"
+    if not (10 <= v <= 300):
+        return False, "jam seconds must be 10–300"
+    with _config_lock:
+        _config["jam_sec"] = v
+        try:
+            _save_config_locked()
+        except Exception as e:
+            return False, f"saved in memory but write failed: {e}"
+    print(f"[config] jam_sec set to {v}")
+    return True, v
 
 
 def get_supabase():
@@ -671,8 +700,6 @@ def motor_get():
 TELEGRAM_TOKEN      = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT       = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 TELEGRAM_RETENTION_H = 48                 # delete tracked messages older than this
-APP_JAM_SEC = 20                          # camera-Pi guard: STOP a move that runs
-                                          # longer than this without hitting a limit
 _track_lock = threading.Lock()
 _track_id   = 0
 _tg_msgs    = deque(maxlen=2000)          # [(message_id, epoch), ...] for cleanup
@@ -714,11 +741,11 @@ def _tg_handle(text):
     """Execute a command received over Telegram (already authorised)."""
     cmd = text.strip().lower().lstrip("/").split()[0] if text.strip() else ""
     if cmd in ("open", "up"):
-        ok, _ = motor_post("up");   log_action("telegram:open", ok, _);  on_motor_command("up", ok)
+        ok, _ = motor_post("up");   log_action("up", ok, _, "telegram");   on_motor_command("up", ok)
     elif cmd in ("close", "down"):
-        ok, _ = motor_post("down"); log_action("telegram:close", ok, _); on_motor_command("down", ok)
+        ok, _ = motor_post("down"); log_action("down", ok, _, "telegram"); on_motor_command("down", ok)
     elif cmd in ("stop",):
-        ok, _ = motor_post("stop"); log_action("telegram:stop", ok, _);  on_motor_command("stop", ok)
+        ok, _ = motor_post("stop"); log_action("stop", ok, _, "telegram"); on_motor_command("stop", ok)
     elif cmd in ("status", "state"):
         ok, st = motor_get()
         if ok and isinstance(st, dict):
@@ -770,18 +797,54 @@ def _tg_cleanup():
                     pass
 
 
+HEALTH_EVERY_H = 3        # report cadence (hours)
+HEALTH_START   = 7        # only during daytime, [start, end)
+HEALTH_END     = 22
+
+
+def _build_health():
+    lines = ["🩺 Coop health"]
+    cam = read_cpu_temp()
+    lines.append(f"• Camera Pi: {cam if cam is not None else '?'}°C")
+    ok, st = motor_get()
+    if ok and isinstance(st, dict):
+        lines.append(f"• Motor Pi: online, {st.get('temp','?')}°C, v{st.get('version','?')}")
+        lines.append(f"• Door: {st.get('door_state','?')} (motor {st.get('state','?')})")
+    else:
+        lines.append("• Motor Pi: ⚠️ UNREACHABLE")
+    url, _ = get_egg_db()
+    if url:
+        lines.append("• Eggs: Supabase " + ("online" if _egg_online else "⚠️ offline")
+                     + (f", {len(_egg_pending)} queued" if _egg_pending else ""))
+    return "\n".join(lines)
+
+
+def _health_report():
+    """Every HEALTH_EVERY_H hours during daytime, push a status summary."""
+    last = None
+    while True:
+        h = time.localtime().tm_hour
+        if HEALTH_START <= h < HEALTH_END and h % HEALTH_EVERY_H == 0:
+            key = time.strftime("%Y-%m-%d %H")     # once per matching hour
+            if key != last:
+                last = key
+                notify(_build_health())
+        time.sleep(60)
+
+
 def _track_completion(expect):
     """Watch a move to completion AND enforce an app-level jam guard: if the door
-    is still moving after APP_JAM_SEC, send STOP over the API. This is a guard
+    is still moving after the configured jam timeout, send STOP over the API. Guard
     rail the CAMERA Pi enforces via HTTP — it works even when the motor Pi's own
     firmware can't be updated. `expect` = the door_state a good move ends in."""
     global _track_id
+    jam_sec = get_jam_sec()
     with _track_lock:
         _track_id += 1
         tid = _track_id
     def worker():
         t0 = time.time()
-        while time.time() - t0 < APP_JAM_SEC + 10:
+        while time.time() - t0 < jam_sec + 10:
             time.sleep(1.5)
             with _track_lock:
                 if tid != _track_id:            # superseded by a newer command
@@ -798,11 +861,11 @@ def _track_completion(expect):
                     notify(f"⚠️ Coop door stopped without reaching {end} (state: {ds}) — check it")
                 return
             # Guard rail: still moving past the limit → force stop.
-            if time.time() - t0 > APP_JAM_SEC:
+            if time.time() - t0 > jam_sec:
                 motor_post("stop")
                 with _track_lock:
                     _track_id += 1              # cancel self (we issued the stop)
-                notify(f"⛔ Jam guard: door ran >{APP_JAM_SEC}s without reaching its "
+                notify(f"⛔ Jam guard: door ran >{jam_sec}s without reaching its "
                        f"limit — sent STOP. Check the door.")
                 return
     threading.Thread(target=worker, daemon=True).start()
@@ -838,9 +901,9 @@ _actions      = deque(maxlen=20)
 _actions_lock = threading.Lock()
 
 
-def log_action(cmd, ok, detail):
+def log_action(cmd, ok, detail, source="dashboard"):
     with _actions_lock:
-        _actions.appendleft({"t": int(time.time()), "cmd": cmd,
+        _actions.appendleft({"t": int(time.time()), "cmd": cmd, "source": source,
                              "ok": bool(ok), "detail": str(detail)})
 
 
@@ -868,7 +931,7 @@ def _scheduler():
                     continue                      # already ran today
                 _sched_fired[slot] = today
                 ok, res = motor_post("up")
-                log_action("schedule:" + slot, ok, res)
+                log_action("up", ok, res, "schedule")
                 notify(f"⏰ Scheduled open ({hhmm})")
                 on_motor_command("up", ok)   # push + track to completion
                 print(f"[sched] {slot} open fired at {hhmm} -> ok={ok} {res}")
@@ -1337,6 +1400,8 @@ header{width:100%;max-width:1100px;display:flex;align-items:center;gap:14px;flex
   padding:3px 8px;border-radius:4px;background:var(--bg)}
 .act .at{color:var(--muted)}
 .act .an{font-weight:700;min-width:74px}
+.act .asrc{color:var(--muted);font-size:.6rem;padding:1px 6px;border-radius:20px;
+  background:rgba(90,96,112,.18);border:1px solid var(--border)}
 .act .ad{color:var(--muted);margin-left:auto}
 .act.ok .an{color:var(--text)}
 .act.bad .an,.act.bad .ad{color:var(--red)}
@@ -1555,6 +1620,7 @@ function fmtActTime(sec){
        + ':' + ('0'+d.getSeconds()).slice(-2);
 }
 var ACT_NAME = {up: 'Open', down: 'Close', stop: 'Force stop'};
+var SRC_ICON = {dashboard: '🖥 button', telegram: '✈ telegram', schedule: '⏰ schedule'};
 function loadActions() {
   fetch('/actions').then(function(r){ return r.json(); }).then(function(d){
     var ul = document.getElementById('acts-list');
@@ -1564,8 +1630,10 @@ function loadActions() {
     a.forEach(function(x){
       var li = document.createElement('li');
       li.className = 'act ' + (x.ok ? 'ok' : 'bad');
+      var src = SRC_ICON[x.source] || x.source || '';
       li.innerHTML = '<span class="at">' + fmtActTime(x.t) + '</span>'
                    + '<span class="an">' + (ACT_NAME[x.cmd] || x.cmd) + '</span>'
+                   + '<span class="asrc">' + src + '</span>'
                    + '<span class="ad">' + (x.ok ? x.detail : 'failed') + '</span>';
       ul.appendChild(li);
     });
@@ -1665,8 +1733,22 @@ function loadConfig() {
     if (u) u.value = d.supabase_url || '';
     if (t) t.placeholder = d.supabase_key_set ? 'key saved (leave blank to keep)'
                                               : 'anon key';
+    var j = document.getElementById('jam-sec');
+    if (j && d.jam_sec) j.value = d.jam_sec;
   })
   .catch(function(){});
+}
+function saveJam() {
+  var st = document.getElementById('jam-status');
+  fetch('/config', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({jam_sec: parseInt(document.getElementById('jam-sec').value)})})
+  .then(function(r){ return r.json(); })
+  .then(function(d){
+    st.textContent = d.ok ? 'Saved \\u2713' : (d.error || 'error');
+    st.style.color = d.ok ? 'var(--green)' : 'var(--red)';
+    setTimeout(function(){ st.textContent = ''; }, 3000);
+  })
+  .catch(function(){ st.textContent = 'Network error'; st.style.color = 'var(--red)'; });
 }
 function saveMotorIp() {
   var ip  = document.getElementById('ip-input').value.trim();
@@ -2048,6 +2130,16 @@ def build_dashboard(cameras):
         '    <button class="ip-save" onclick="saveSchedule()">Save</button>\n'
         '    <span class="ip-status" id="sch-status"></span>\n'
         '  </div>\n'
+        '  <div class="sched-row">\n'
+        '    <span class="ip-label">Jam guard</span>\n'
+        '    <span class="sw"><span>stop a move after</span></span>\n'
+        '    <input class="tm" id="jam-sec" type="number" min="10" max="300" '
+        'step="5" value="60" style="width:70px"/>\n'
+        '    <span style="color:var(--muted);font-family:monospace;font-size:.7rem">'
+        'sec without hitting a limit</span>\n'
+        '    <button class="ip-save" onclick="saveJam()">Save</button>\n'
+        '    <span class="ip-status" id="jam-status"></span>\n'
+        '  </div>\n'
         '  <div class="acts">\n'
         '    <span class="acts-label">Recent actions <i>(this session only)</i></span>\n'
         '    <ul class="acts-list" id="acts-list"><li class="acts-none">None yet</li></ul>\n'
@@ -2195,7 +2287,8 @@ class Handler(BaseHTTPRequestHandler):
             sb_url, sb_key = get_supabase()
             self._json(200, {"motor_pi_ip": get_motor_ip(), "motor_port": MOTOR_PORT,
                              "supabase_url": sb_url,
-                             "supabase_key_set": bool(sb_key)})
+                             "supabase_key_set": bool(sb_key),
+                             "jam_sec": get_jam_sec()})
 
         elif path == "/pipeline":
             self._json(200, {"sdk": REALSENSE_SDK,
@@ -2256,6 +2349,11 @@ class Handler(BaseHTTPRequestHandler):
                                      "online": _egg_online})
                 else:
                     self._json(400, {"ok": False, "error": result})
+                return
+            if "jam_sec" in data:
+                ok, result = set_jam_sec(data.get("jam_sec"))
+                self._json(200 if ok else 400,
+                           {"ok": ok, ("jam_sec" if ok else "error"): result})
                 return
             ok, result = set_motor_ip(data.get("motor_pi_ip", ""))
             if ok:
@@ -2350,6 +2448,7 @@ if __name__ == "__main__":
     if _tg_configured():
         threading.Thread(target=_tg_poll, daemon=True).start()
         threading.Thread(target=_tg_cleanup, daemon=True).start()
+        threading.Thread(target=_health_report, daemon=True).start()
         print("[telegram] enabled")
     cams = get_cameras(force=True)     # warm the cache while the device is idle
     print(f"[dashboard] cameras: {[c['name'] for c in cams] or 'none'}")
