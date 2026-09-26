@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from urllib.request import urlopen, Request
 from urllib.error import URLError
+import urllib.parse
 
 # RealSense SDK — opens RGB+IR from ONE device handle, killing the two-ffmpeg
 # USB negotiation race. If unavailable, we fall back to the staggered ffmpeg path.
@@ -71,7 +72,7 @@ def encode_jpeg(arr, gray, quality=80):
     return None
 
 # ── config ────────────────────────────────────────────────────────────────────
-VERSION     = "1.19.0"
+VERSION     = "1.20.0"
 PORT        = 8080
 FPS         = 10          # ffmpeg/UVC: lower FPS reduces USB bandwidth contention
 REALSENSE_FPS = 15        # Indoor camera. 15 is verified working on this D4xx;
@@ -661,6 +662,75 @@ def motor_get():
         return False, str(e)
 
 
+# ── Telegram push (optional) ──────────────────────────────────────────────────
+# Runs on the CAMERA Pi so it fires for manual AND scheduled commands, even with
+# no browser open. Set TELEGRAM_TOKEN + TELEGRAM_CHAT_ID in the environment
+# (telegram.env, loaded by the systemd unit). Empty = off.
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+_track_lock = threading.Lock()
+_track_id   = 0
+
+
+def notify(text):
+    """Fire-and-forget Telegram message. Never blocks the caller."""
+    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT):
+        return
+    def worker():
+        try:
+            url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            data = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT, "text": text}).encode()
+            urlopen(Request(url, data=data), timeout=5).read()
+        except Exception as e:
+            print(f"[telegram] notify failed: {e}")
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _track_completion(expect):
+    """Poll the motor until it stops, then report the outcome. `expect` is the
+    door_state we should end in ('open' / 'closed'); anything else = didn't reach
+    the limit (jam / stopped early)."""
+    global _track_id
+    with _track_lock:
+        _track_id += 1
+        tid = _track_id
+    def worker():
+        t0 = time.time()
+        while time.time() - t0 < 45:
+            time.sleep(1.5)
+            with _track_lock:
+                if tid != _track_id:      # a newer command superseded this one
+                    return
+            ok, st = motor_get()
+            if not ok or not isinstance(st, dict):
+                continue
+            if st.get("state") == "stopped":
+                ds = st.get("door_state")
+                if ds == expect:
+                    notify("✅ Coop door OPEN" if expect == "open" else "✅ Coop door CLOSED")
+                else:
+                    end = "top" if expect == "open" else "bottom"
+                    notify(f"⚠️ Coop door did not reach {end} (state: {ds}) — check it")
+                return
+        notify("⚠️ Coop door move timed out — check it")
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def on_motor_command(cmd, ok):
+    """Send Telegram for a dispatched command + track it to completion."""
+    global _track_id
+    if not ok:
+        return
+    if cmd == "up":
+        notify("🔓 Coop door opening…");   _track_completion("open")
+    elif cmd == "down":
+        notify("🔒 Coop door closing…");   _track_completion("closed")
+    elif cmd == "stop":
+        with _track_lock:                  # cancel any running tracker
+            _track_id += 1
+        notify("⏹ Coop door force-stopped")
+
+
 def motor_version():
     """Fetch the motor Pi's reported version. Returns the string or None."""
     try:
@@ -707,6 +777,8 @@ def _scheduler():
                 _sched_fired[slot] = today
                 ok, res = motor_post("up")
                 log_action("schedule:" + slot, ok, res)
+                notify(f"⏰ Scheduled open ({hhmm})")
+                on_motor_command("up", ok)   # push + track to completion
                 print(f"[sched] {slot} open fired at {hhmm} -> ok={ok} {res}")
         except Exception as e:
             print(f"[sched] error: {e}")
@@ -2155,6 +2227,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         ok, result = motor_post(cmd)
         log_action(cmd, ok, result)
+        on_motor_command(cmd, ok)          # Telegram push + completion tracking
         if ok:
             self._json(200, {"ok": True, "state": result})
         else:
