@@ -72,7 +72,7 @@ def encode_jpeg(arr, gray, quality=80):
     return None
 
 # ── config ────────────────────────────────────────────────────────────────────
-VERSION     = "1.22.0"
+VERSION     = "1.22.1"
 PORT        = 8080
 FPS         = 10          # ffmpeg/UVC: lower FPS reduces USB bandwidth contention
 REALSENSE_FPS = 15        # Indoor camera. 15 is verified working on this D4xx;
@@ -843,6 +843,7 @@ def _track_completion(expect):
         _track_id += 1
         tid = _track_id
     def worker():
+        global _track_id
         t0 = time.time()
         while time.time() - t0 < jam_sec + 10:
             time.sleep(1.5)
