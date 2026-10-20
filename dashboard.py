@@ -14,7 +14,7 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from urllib.request import urlopen, Request
-from urllib.error import URLError
+from urllib.error import URLError, HTTPError
 import urllib.parse
 
 # RealSense SDK — opens RGB+IR from ONE device handle, killing the two-ffmpeg
@@ -72,7 +72,7 @@ def encode_jpeg(arr, gray, quality=80):
     return None
 
 # ── config ────────────────────────────────────────────────────────────────────
-VERSION     = "1.23.0"
+VERSION     = "1.23.1"
 PORT        = 8080
 FPS         = 10          # ffmpeg/UVC: lower FPS reduces USB bandwidth contention
 REALSENSE_FPS = 15        # Indoor camera. 15 is verified working on this D4xx;
@@ -639,6 +639,11 @@ def sand_post(cmd):
                        headers={"Content-Type": "application/json"}, method="POST")
         with urlopen(req, timeout=4) as r:
             return True, json.loads(r.read()).get("state", "unknown")
+    except HTTPError as e:                 # e.g. 429 "resting Ns (duty cycle)"
+        try:
+            return False, json.loads(e.read()).get("error", str(e))
+        except Exception:
+            return False, str(e)
     except Exception as e:
         return False, str(e)
 
@@ -1832,6 +1837,11 @@ var SAND_BADGE = {idle:['db-closed','Idle'], extending:['db-moving','Dumping…'
                   retracting:['db-moving','Homing…']};
 function renderSand(d) {
   var b = document.getElementById('sand-badge');
+  if (d && d.resting) {
+    b.className = 'door-badge db-partial';
+    b.textContent = 'resting ' + d.rest_left + 's';
+    return;
+  }
   var m = SAND_BADGE[d && d.state] || ['db-unknown', d && d.state === undefined
             ? 'not configured' : (d && d.state || '?')];
   b.className = 'door-badge ' + m[0]; b.textContent = m[1];
@@ -1843,10 +1853,17 @@ function pollSand() {
   .catch(function(){ renderSand({state:'offline'}); });
 }
 function sandCmd(cmd) {
+  var st = document.getElementById('sand-status');
   fetch('/sand', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({cmd: cmd})})
   .then(function(r){ return r.json(); })
-  .then(function(d){ if (d.state) renderSand(d); setTimeout(pollSand, 1000); })
+  .then(function(d){
+    if (d.ok === false || d.error) {
+      st.textContent = d.error || 'error'; st.style.color = 'var(--amber)';
+      setTimeout(function(){ st.textContent = ''; }, 4000);
+    } else if (d.state) { renderSand(d); }
+    setTimeout(pollSand, 1000);
+  })
   .catch(function(){});
 }
 function saveSand() {

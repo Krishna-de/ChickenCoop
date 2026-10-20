@@ -1,94 +1,120 @@
 #!/usr/bin/env python3
 """
-sand_server.py — runs on the SAND Pi
-Timed actuator control for sand-dumping. Drives an H-bridge / dual-relay
-(IN1/IN2) one way to EXTEND (dump) and the other to RETRACT (home), each for a
-fixed "duty cycle" period, then stops. No limit switches — travel is time-based.
+sand_server.py — runs on the SAND Pi (Pi 3 Model B)
+HTTP control for the sand-dump linear actuator. Mirrors the bench-tested wiring
+in sand_dump_test.py: a 2-channel relay H-bridge driving a 12V actuator.
+
+  Relay 2 / EXTEND  -> GPIO 22 (board pin 15)  -> rod out  (dump)
+  Relay 1 / RETRACT -> GPIO 17 (board pin 11)  -> rod in   (home)
+  Both relays off -> both COMs to GND -> motor braked.
+
+Safety, carried over from the bench script:
+  - DEAD_TIME between reversing (never energise both relays).
+  - MAX_RUN hard cap on any single run.
+  - 20% DUTY_CYCLE: the actuator must rest ~4x its last run time. A command
+    that arrives too soon is REJECTED with the remaining rest (protects the
+    actuator from overheating on an unattended system).
 
 Endpoints:
-  POST /sand    body: {"cmd":"extend"|"dump"|"retract"|"home"|"stop", "duty":<sec?>}
-  GET  /sand    -> {"state":"idle|extending|retracting", "duty_default":40, ...}
-
-`duty` is optional per-command; if absent, DUTY_CYCLE_SEC is used. The dashboard
-sends the admin-configured value with each command.
+  POST /sand  {"cmd":"extend|dump|retract|home|stop", "duty":<sec?>}
+  GET  /sand  -> {"state","duty_default","resting","rest_left","version"}
 
 Start: python3 sand_server.py   (default port 8082)
 """
 
 import json, threading, time, sys, signal, logging
-import RPi.GPIO as GPIO
+from gpiozero import OutputDevice
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
-# ── config ──────────────────────────────────────────────────────────────────
-IN1_PIN  = 20          # H-bridge / relay direction A  (board pin 38)
-IN2_PIN  = 21          # H-bridge / relay direction B  (board pin 40)
-PORT     = 8082
-VERSION  = "1.0.0"
+# ── config (matches sand_dump_test.py) ───────────────────────────────────────
+EXTEND_PIN  = 22       # relay 2 / IN2 / board pin 15
+RETRACT_PIN = 17       # relay 1 / IN1 / board pin 11
+PORT        = 8082
+VERSION     = "1.1.0"
 
-DUTY_CYCLE_SEC = 40    # default run time per extend/retract if none supplied
-DUTY_MIN, DUTY_MAX = 1, 120   # clamp — never run the actuator longer than this
+DEFAULT_TRAVEL = 40    # run time per command if none supplied (the "duty period")
+DEAD_TIME   = 0.3      # both relays off this long before energising the other
+MAX_RUN     = 90       # hard cap on any single run (seconds)
+DUTY_CYCLE  = 0.20     # actuator manual: 20% -> rest = run * (1-0.2)/0.2 = run*4
+RUN_MIN, RUN_MAX = 1, MAX_RUN
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO,
                     format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("sand")
+
+extend_dev  = OutputDevice(EXTEND_PIN,  active_high=True, initial_value=False)
+retract_dev = OutputDevice(RETRACT_PIN, active_high=True, initial_value=False)
 
 # ── state ───────────────────────────────────────────────────────────────────
 stop_evt    = threading.Event()
 worker      = None
 state_label = "idle"            # idle | extending | retracting
 state_lock  = threading.Lock()
-cmd_lock    = threading.Lock()  # serialize start/stop — one motion at a time
-
-
-def setup():
-    GPIO.setwarnings(False)
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setup(IN1_PIN, GPIO.OUT, initial=GPIO.LOW)
-    GPIO.setup(IN2_PIN, GPIO.OUT, initial=GPIO.LOW)
+cmd_lock    = threading.Lock()
+_last_run_s = 0.0               # duration of the last run (for duty rest calc)
+_last_stop  = 0.0               # monotonic time the last run ended
 
 
 def _coast():
-    """Both low = motor off (never both high — that shorts an H-bridge)."""
-    GPIO.output(IN1_PIN, GPIO.LOW)
-    GPIO.output(IN2_PIN, GPIO.LOW)
+    extend_dev.off()
+    retract_dev.off()
 
 
-def _run(direction, duty):
-    """Drive one direction for `duty` seconds (or until stop), then coast."""
-    global state_label
-    a, b = (GPIO.HIGH, GPIO.LOW) if direction == "extend" else (GPIO.LOW, GPIO.HIGH)
-    GPIO.output(IN1_PIN, a)
-    GPIO.output(IN2_PIN, b)
-    stop_evt.wait(timeout=duty)            # returns early if stop_evt is set
+def rest_left():
+    """Seconds of rest still required before the actuator may run again."""
+    if _last_run_s <= 0:
+        return 0
+    need = _last_run_s * (1 - DUTY_CYCLE) / DUTY_CYCLE
+    return max(0, int(need - (time.monotonic() - _last_stop)))
+
+
+def _run(direction, seconds):
+    global state_label, _last_run_s, _last_stop
     _coast()
+    time.sleep(DEAD_TIME)                 # guarantee no relay overlap
+    if direction == "extend":
+        retract_dev.off(); extend_dev.on()
+    else:
+        extend_dev.off(); retract_dev.on()
+    t0 = time.monotonic()
+    stop_evt.wait(timeout=seconds)        # returns early if stopped
+    _coast()
+    _last_run_s = time.monotonic() - t0
+    _last_stop  = time.monotonic()
     with state_lock:
         state_label = "idle"
-    log.info(f"{direction} done (coast)")
+    log.info(f"{direction} done after {_last_run_s:.1f}s")
 
 
 def _stop_locked():
     global worker, state_label
     stop_evt.set()
     if worker and worker.is_alive():
-        worker.join(timeout=DUTY_MAX + 1)
+        worker.join(timeout=MAX_RUN + 1)
     worker = None
     _coast()
     with state_lock:
         state_label = "idle"
 
 
-def start(direction, duty):
+def start(direction, seconds):
+    """Returns (ok, msg). Rejects if the actuator still needs to rest."""
     global worker, state_label
-    duty = max(DUTY_MIN, min(int(duty), DUTY_MAX))
+    seconds = max(RUN_MIN, min(int(seconds), RUN_MAX))
+    rl = rest_left()
+    if rl > 0:
+        log.info(f"{direction} refused — resting {rl}s more (20% duty)")
+        return False, f"resting {rl}s (20% duty cycle)"
     with cmd_lock:
-        _stop_locked()                     # cancel any current motion first
+        _stop_locked()
         stop_evt.clear()
         with state_lock:
             state_label = "extending" if direction == "extend" else "retracting"
-        worker = threading.Thread(target=_run, args=(direction, duty), daemon=True)
+        worker = threading.Thread(target=_run, args=(direction, seconds), daemon=True)
         worker.start()
-    log.info(f"start {direction} for {duty}s")
+    log.info(f"start {direction} for {seconds}s")
+    return True, state_label
 
 
 def stop():
@@ -99,7 +125,8 @@ def stop():
 
 def shutdown(sig=None, frame=None):
     stop()
-    GPIO.cleanup()
+    extend_dev.close()
+    retract_dev.close()
     log.info("shutdown")
     sys.exit(0)
 
@@ -133,8 +160,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.split("?")[0] == "/sand":
             with state_lock:
                 st = state_label
-            self._json(200, {"state": st, "duty_default": DUTY_CYCLE_SEC,
-                             "version": VERSION})
+            rl = rest_left()
+            self._json(200, {"state": st, "duty_default": DEFAULT_TRAVEL,
+                             "resting": rl > 0, "rest_left": rl, "version": VERSION})
         else:
             self._json(404, {"error": "not found"})
 
@@ -147,24 +175,26 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             self._json(400, {"error": "bad json"}); return
         cmd  = str(data.get("cmd", "")).lower()
-        duty = data.get("duty", DUTY_CYCLE_SEC)
+        duty = data.get("duty", DEFAULT_TRAVEL)
         log.info(f"POST cmd={cmd!r} duty={duty} from {self.client_address[0]}")
         if cmd in ("extend", "dump"):
-            start("extend", duty)
+            ok, msg = start("extend", duty)
         elif cmd in ("retract", "home"):
-            start("retract", duty)
+            ok, msg = start("retract", duty)
         elif cmd == "stop":
-            stop()
+            stop(); ok, msg = True, "idle"
         else:
             self._json(400, {"error": f"unknown cmd: {cmd}"}); return
         with state_lock:
-            self._json(200, {"ok": True, "state": state_label})
+            self._json(200 if ok else 429,
+                       {"ok": ok, "state": state_label} if ok
+                       else {"ok": False, "error": msg})
 
 
 if __name__ == "__main__":
-    setup()
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT,  shutdown)
-    log.info(f"[sand_server] v{VERSION} listening on port {PORT} "
-             f"(IN1={IN1_PIN}, IN2={IN2_PIN}, duty={DUTY_CYCLE_SEC}s)")
+    log.info(f"[sand_server] v{VERSION} on port {PORT} "
+             f"(EXTEND=GPIO{EXTEND_PIN}, RETRACT=GPIO{RETRACT_PIN}, "
+             f"dead={DEAD_TIME}s, cap={MAX_RUN}s, duty={DUTY_CYCLE*100:.0f}%)")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
