@@ -72,7 +72,7 @@ def encode_jpeg(arr, gray, quality=80):
     return None
 
 # ── config ────────────────────────────────────────────────────────────────────
-VERSION     = "1.23.2"
+VERSION     = "1.23.3"
 PORT        = 8080
 FPS         = 10          # ffmpeg/UVC: lower FPS reduces USB bandwidth contention
 REALSENSE_FPS = 15        # Indoor camera. 15 is verified working on this D4xx;
@@ -1852,6 +1852,21 @@ function pollSand() {
   .then(function(d){ renderSand(d.state !== undefined ? d : {state:'?'}); })
   .catch(function(){ renderSand({state:'offline'}); });
 }
+var sandWatchTimer = null;
+function sandWatch() {
+  // Fast-poll while a run is in progress so the badge updates the instant the
+  // run ends — whether by the duty timer finishing or the Stop button.
+  if (sandWatchTimer) return;
+  var t0 = Date.now();
+  sandWatchTimer = setInterval(function(){
+    fetch('/sand').then(function(r){ return r.json(); }).then(function(d){
+      renderSand(d.state !== undefined ? d : {state:'?'});
+      if (!d.state || d.state === 'idle' || Date.now() - t0 > 100000) {
+        clearInterval(sandWatchTimer); sandWatchTimer = null;
+      }
+    }).catch(function(){});
+  }, 2000);
+}
 function sandCmd(cmd) {
   var st = document.getElementById('sand-status');
   fetch('/sand', {method:'POST', headers:{'Content-Type':'application/json'},
@@ -1868,7 +1883,8 @@ function sandCmd(cmd) {
       }
       if (d.state) renderSand(d);
     }
-    setTimeout(pollSand, 1000);
+    if (cmd === 'stop') { setTimeout(pollSand, 500); }
+    else { sandWatch(); }                  // track the run to its end
   })
   .catch(function(){});
 }
