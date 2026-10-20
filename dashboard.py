@@ -72,7 +72,7 @@ def encode_jpeg(arr, gray, quality=80):
     return None
 
 # ── config ────────────────────────────────────────────────────────────────────
-VERSION     = "1.23.1"
+VERSION     = "1.23.2"
 PORT        = 8080
 FPS         = 10          # ffmpeg/UVC: lower FPS reduces USB bandwidth contention
 REALSENSE_FPS = 15        # Indoor camera. 15 is verified working on this D4xx;
@@ -638,8 +638,8 @@ def sand_post(cmd):
         req  = Request(sand_base(), data=body,
                        headers={"Content-Type": "application/json"}, method="POST")
         with urlopen(req, timeout=4) as r:
-            return True, json.loads(r.read()).get("state", "unknown")
-    except HTTPError as e:                 # e.g. 429 "resting Ns (duty cycle)"
+            return True, json.loads(r.read())     # full dict: state (+ warn)
+    except HTTPError as e:
         try:
             return False, json.loads(e.read()).get("error", str(e))
         except Exception:
@@ -1859,9 +1859,15 @@ function sandCmd(cmd) {
   .then(function(r){ return r.json(); })
   .then(function(d){
     if (d.ok === false || d.error) {
-      st.textContent = d.error || 'error'; st.style.color = 'var(--amber)';
+      st.textContent = d.error || 'error'; st.style.color = 'var(--red)';
       setTimeout(function(){ st.textContent = ''; }, 4000);
-    } else if (d.state) { renderSand(d); }
+    } else {
+      if (d.warn) {                        // ran, but inside the duty-cycle rest
+        st.textContent = '⚠ ' + d.warn; st.style.color = 'var(--amber)';
+        setTimeout(function(){ st.textContent = ''; }, 4000);
+      }
+      if (d.state) renderSand(d);
+    }
     setTimeout(pollSand, 1000);
   })
   .catch(function(){});
@@ -2547,10 +2553,11 @@ class Handler(BaseHTTPRequestHandler):
             if cmd not in ("extend", "dump", "retract", "home", "stop"):
                 self._json(400, {"error": f"unknown cmd: {cmd}"}); return
             ok, result = sand_post(cmd)
-            log_action("sand:" + cmd, ok, result)
             if ok:
-                self._json(200, {"ok": True, "state": result})
+                log_action("sand:" + cmd, True, result.get("state", "?"))
+                self._json(200, dict(result, ok=True))      # state (+ warn)
             else:
+                log_action("sand:" + cmd, False, result)
                 self._json(502, {"ok": False, "error": result})
             return
 

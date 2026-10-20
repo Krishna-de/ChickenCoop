@@ -99,22 +99,23 @@ def _stop_locked():
 
 
 def start(direction, seconds):
-    """Returns (ok, msg). Rejects if the actuator still needs to rest."""
+    """Always runs (user can dump/home anytime). Returns (ok, warn) where warn is
+    a duty-cycle advisory if the actuator hasn't fully rested — not a block."""
     global worker, state_label
     seconds = max(RUN_MIN, min(int(seconds), RUN_MAX))
     rl = rest_left()
-    if rl > 0:
-        log.info(f"{direction} refused — resting {rl}s more (20% duty)")
-        return False, f"resting {rl}s (20% duty cycle)"
+    warn = f"ran during {rl}s duty-cycle rest" if rl > 0 else ""
+    if warn:
+        log.info(f"{direction}: {warn} — running anyway")
     with cmd_lock:
-        _stop_locked()
+        _stop_locked()                    # stop/reverse any current motion first
         stop_evt.clear()
         with state_lock:
             state_label = "extending" if direction == "extend" else "retracting"
         worker = threading.Thread(target=_run, args=(direction, seconds), daemon=True)
         worker.start()
     log.info(f"start {direction} for {seconds}s")
-    return True, state_label
+    return True, warn
 
 
 def stop():
@@ -177,18 +178,20 @@ class Handler(BaseHTTPRequestHandler):
         cmd  = str(data.get("cmd", "")).lower()
         duty = data.get("duty", DEFAULT_TRAVEL)
         log.info(f"POST cmd={cmd!r} duty={duty} from {self.client_address[0]}")
+        warn = ""
         if cmd in ("extend", "dump"):
-            ok, msg = start("extend", duty)
+            _, warn = start("extend", duty)
         elif cmd in ("retract", "home"):
-            ok, msg = start("retract", duty)
+            _, warn = start("retract", duty)
         elif cmd == "stop":
-            stop(); ok, msg = True, "idle"
+            stop()
         else:
             self._json(400, {"error": f"unknown cmd: {cmd}"}); return
         with state_lock:
-            self._json(200 if ok else 429,
-                       {"ok": ok, "state": state_label} if ok
-                       else {"ok": False, "error": msg})
+            resp = {"ok": True, "state": state_label}
+        if warn:
+            resp["warn"] = warn
+        self._json(200, resp)
 
 
 if __name__ == "__main__":
