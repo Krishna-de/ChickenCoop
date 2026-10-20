@@ -72,7 +72,7 @@ def encode_jpeg(arr, gray, quality=80):
     return None
 
 # ── config ────────────────────────────────────────────────────────────────────
-VERSION     = "1.22.1"
+VERSION     = "1.23.0"
 PORT        = 8080
 FPS         = 10          # ffmpeg/UVC: lower FPS reduces USB bandwidth contention
 REALSENSE_FPS = 15        # Indoor camera. 15 is verified working on this D4xx;
@@ -514,6 +514,8 @@ _config = {
     "supabase_key": "",
     "jam_sec": 60,            # app-level guard: STOP a move that runs this long
                              # without reaching a limit (10–300s)
+    "sand_pi_ip": "",         # sand-dumping Pi (empty = feature hidden/off)
+    "sand_duty_sec": 40,      # extend/retract run time (admin-set, 1–120s)
     "schedule": {
         "open1_enabled": True,  "open1_time": "07:00",
         "open2_enabled": True,  "open2_time": "21:00",
@@ -556,6 +558,14 @@ def _load_config():
             _config["jam_sec"] = max(10, min(js, 300))
         except (TypeError, ValueError):
             pass
+        ip = data.get("sand_pi_ip")
+        if isinstance(ip, str) and (ip == "" or _IP_RE.match(ip)):
+            _config["sand_pi_ip"] = ip.strip()
+        try:
+            ds = int(data.get("sand_duty_sec"))
+            _config["sand_duty_sec"] = max(1, min(ds, 120))
+        except (TypeError, ValueError):
+            pass
         sch = data.get("schedule")
         if isinstance(sch, dict):
             for k in ("open1_enabled", "open2_enabled"):
@@ -581,6 +591,67 @@ def get_schedule():
 def get_jam_sec():
     with _config_lock:
         return _config["jam_sec"]
+
+
+def get_sand():
+    with _config_lock:
+        return _config["sand_pi_ip"], _config["sand_duty_sec"]
+
+
+def set_sand(ip, duty):
+    """Set sand Pi IP ('' disables) and duty-cycle seconds. (ok, error)."""
+    ip = (ip or "").strip()
+    if ip and not _IP_RE.match(ip):
+        return False, "invalid sand Pi IP"
+    try:
+        duty = int(duty)
+    except (TypeError, ValueError):
+        return False, "duty must be a number"
+    if not (1 <= duty <= 120):
+        return False, "duty must be 1–120 seconds"
+    with _config_lock:
+        _config["sand_pi_ip"]    = ip
+        _config["sand_duty_sec"] = duty
+        try:
+            _save_config_locked()
+        except Exception as e:
+            return False, f"saved in memory but write failed: {e}"
+    print(f"[config] sand Pi={ip or 'off'} duty={duty}s")
+    return True, None
+
+
+SAND_PORT = 8082
+
+
+def sand_base():
+    ip, _ = get_sand()
+    return f"http://{ip}:{SAND_PORT}/sand"
+
+
+def sand_post(cmd):
+    """Relay a sand command, sending the admin-configured duty cycle."""
+    ip, duty = get_sand()
+    if not ip:
+        return False, "sand Pi not configured"
+    try:
+        body = json.dumps({"cmd": cmd, "duty": duty}).encode()
+        req  = Request(sand_base(), data=body,
+                       headers={"Content-Type": "application/json"}, method="POST")
+        with urlopen(req, timeout=4) as r:
+            return True, json.loads(r.read()).get("state", "unknown")
+    except Exception as e:
+        return False, str(e)
+
+
+def sand_get():
+    ip, _ = get_sand()
+    if not ip:
+        return False, "sand Pi not configured"
+    try:
+        with urlopen(sand_base(), timeout=3) as r:
+            return True, json.loads(r.read())
+    except Exception as e:
+        return False, str(e)
 
 
 def set_jam_sec(v):
@@ -1721,6 +1792,7 @@ function pollMotor(cb) {
   .catch(function(){ motorMissed('Motor Pi unreachable'); });
 }
 setInterval(pollMotor, MOTOR_IDLE_MS);   // slow heartbeat
+setInterval(pollSand, 60000);            // sand status heartbeat
 pollMotor();
 loadActions();
 
@@ -1736,6 +1808,10 @@ function loadConfig() {
                                               : 'anon key';
     var j = document.getElementById('jam-sec');
     if (j && d.jam_sec) j.value = d.jam_sec;
+    var si = document.getElementById('sand-ip'), sd = document.getElementById('sand-duty');
+    if (si) si.value = d.sand_pi_ip || '';
+    if (sd && d.sand_duty_sec) sd.value = d.sand_duty_sec;
+    pollSand();
   })
   .catch(function(){});
 }
@@ -1748,6 +1824,42 @@ function saveJam() {
     st.textContent = d.ok ? 'Saved \\u2713' : (d.error || 'error');
     st.style.color = d.ok ? 'var(--green)' : 'var(--red)';
     setTimeout(function(){ st.textContent = ''; }, 3000);
+  })
+  .catch(function(){ st.textContent = 'Network error'; st.style.color = 'var(--red)'; });
+}
+// ── sand dump ──
+var SAND_BADGE = {idle:['db-closed','Idle'], extending:['db-moving','Dumping…'],
+                  retracting:['db-moving','Homing…']};
+function renderSand(d) {
+  var b = document.getElementById('sand-badge');
+  var m = SAND_BADGE[d && d.state] || ['db-unknown', d && d.state === undefined
+            ? 'not configured' : (d && d.state || '?')];
+  b.className = 'door-badge ' + m[0]; b.textContent = m[1];
+}
+function pollSand() {
+  if (!document.getElementById('sand-ip').value.trim()) { renderSand({}); return; }
+  fetch('/sand').then(function(r){ return r.json(); })
+  .then(function(d){ renderSand(d.state !== undefined ? d : {state:'?'}); })
+  .catch(function(){ renderSand({state:'offline'}); });
+}
+function sandCmd(cmd) {
+  fetch('/sand', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({cmd: cmd})})
+  .then(function(r){ return r.json(); })
+  .then(function(d){ if (d.state) renderSand(d); setTimeout(pollSand, 1000); })
+  .catch(function(){});
+}
+function saveSand() {
+  var st = document.getElementById('sand-status');
+  fetch('/config', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({sand_pi_ip: document.getElementById('sand-ip').value.trim(),
+                          sand_duty_sec: parseInt(document.getElementById('sand-duty').value)})})
+  .then(function(r){ return r.json(); })
+  .then(function(d){
+    st.textContent = d.ok ? 'Saved \\u2713' : (d.error || 'error');
+    st.style.color = d.ok ? 'var(--green)' : 'var(--red)';
+    setTimeout(function(){ st.textContent = ''; }, 3000);
+    if (d.ok) pollSand();
   })
   .catch(function(){ st.textContent = 'Network error'; st.style.color = 'var(--red)'; });
 }
@@ -2151,6 +2263,32 @@ def build_dashboard(cameras):
         '    <div class="kh"><kbd>S</kbd> Force stop</div>\n'
         '  </div>\n'
         '</div>\n'
+        # ── sand-dumping component ──
+        '<div class="door-panel" id="sand-panel">\n'
+        '  <div class="door-head">\n'
+        '    <span class="door-title">&#127958; Sand dump</span>\n'
+        '    <span class="door-badge db-unknown" id="sand-badge">&hellip;</span>\n'
+        '  </div>\n'
+        '  <div class="motor-btns">\n'
+        '    <button class="mbtn mbtn-up"   onclick="sandCmd(\'extend\')">'
+        '<span class="mbtn-icon">&#8679;</span>Dump</button>\n'
+        '    <button class="mbtn mbtn-stop" onclick="sandCmd(\'stop\')">'
+        '<span class="mbtn-icon">&#9632;</span>Stop</button>\n'
+        '    <button class="mbtn mbtn-down" onclick="sandCmd(\'retract\')">'
+        '<span class="mbtn-icon">&#8681;</span>Home</button>\n'
+        '  </div>\n'
+        '  <div class="ip-row">\n'
+        '    <label class="ip-label" for="sand-ip">Sand Pi IP</label>\n'
+        '    <input class="ip-input" id="sand-ip" type="text" spellcheck="false"\n'
+        '           autocomplete="off" placeholder="100.x.x.x (blank = off)"/>\n'
+        '    <span class="sw"><span>duty</span></span>\n'
+        '    <input class="tm" id="sand-duty" type="number" min="1" max="120" '
+        'step="1" value="40" style="width:66px"/>\n'
+        '    <span style="color:var(--muted);font-family:monospace;font-size:.7rem">sec</span>\n'
+        '    <button class="ip-save" onclick="saveSand()">Save</button>\n'
+        '    <span class="ip-status" id="sand-status"></span>\n'
+        '  </div>\n'
+        '</div>\n'
         '</section>\n'
         '<section class="tab-panel" id="tab-eggs">\n'
         '  <div class="egg-panel">\n'
@@ -2286,10 +2424,19 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path == "/config":
             sb_url, sb_key = get_supabase()
+            sand_ip, sand_duty = get_sand()
             self._json(200, {"motor_pi_ip": get_motor_ip(), "motor_port": MOTOR_PORT,
                              "supabase_url": sb_url,
                              "supabase_key_set": bool(sb_key),
-                             "jam_sec": get_jam_sec()})
+                             "jam_sec": get_jam_sec(),
+                             "sand_pi_ip": sand_ip, "sand_duty_sec": sand_duty})
+
+        elif path == "/sand":
+            ok, result = sand_get()
+            if ok:
+                self._json(200, result)
+            else:
+                self._json(502, {"error": result})
 
         elif path == "/pipeline":
             self._json(200, {"sdk": REALSENSE_SDK,
@@ -2329,7 +2476,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?")[0]
-        if path not in ("/motor", "/config", "/pipeline", "/schedule", "/eggs"):
+        if path not in ("/motor", "/config", "/pipeline", "/schedule", "/eggs", "/sand"):
             self.send_error(404)
             return
         length = int(self.headers.get("Content-Length", 0))
@@ -2356,6 +2503,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200 if ok else 400,
                            {"ok": ok, ("jam_sec" if ok else "error"): result})
                 return
+            if "sand_pi_ip" in data or "sand_duty_sec" in data:
+                sip, sdt = get_sand()
+                ok, err = set_sand(data.get("sand_pi_ip", sip),
+                                   data.get("sand_duty_sec", sdt))
+                self._json(200 if ok else 400, {"ok": ok} if ok else
+                           {"ok": False, "error": err})
+                return
             ok, result = set_motor_ip(data.get("motor_pi_ip", ""))
             if ok:
                 self._json(200, {"ok": True, "motor_pi_ip": result})
@@ -2369,6 +2523,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"ok": True, "schedule": result})
             else:
                 self._json(400, {"ok": False, "error": result})
+            return
+
+        if path == "/sand":
+            cmd = str(data.get("cmd", "")).lower()
+            if cmd not in ("extend", "dump", "retract", "home", "stop"):
+                self._json(400, {"error": f"unknown cmd: {cmd}"}); return
+            ok, result = sand_post(cmd)
+            log_action("sand:" + cmd, ok, result)
+            if ok:
+                self._json(200, {"ok": True, "state": result})
+            else:
+                self._json(502, {"ok": False, "error": result})
             return
 
         if path == "/eggs":
