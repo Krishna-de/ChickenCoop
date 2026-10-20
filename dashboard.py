@@ -72,7 +72,7 @@ def encode_jpeg(arr, gray, quality=80):
     return None
 
 # ── config ────────────────────────────────────────────────────────────────────
-VERSION     = "1.23.3"
+VERSION     = "1.24.0"
 PORT        = 8080
 FPS         = 10          # ffmpeg/UVC: lower FPS reduces USB bandwidth contention
 REALSENSE_FPS = 15        # Indoor camera. 15 is verified working on this D4xx;
@@ -1558,12 +1558,13 @@ var PANEL = {L: 'left', R: 'right'};
 function kindLabel(kind){ return kind === 'uvc' ? 'Outside' : 'Indoor'; }
 
 function showTab(name){
-  ['live', 'eggs', 'temps'].forEach(function(t){
+  ['live', 'controls', 'eggs', 'temps'].forEach(function(t){
     document.getElementById('tab-' + t).classList.toggle('active', t === name);
     document.getElementById('tab-btn-' + t).classList.toggle('active', t === name);
   });
-  if (name === 'temps') loadTemps();
-  if (name === 'eggs')  loadEggs();
+  if (name === 'temps')    loadTemps();
+  if (name === 'eggs')     loadEggs();
+  if (name === 'controls') { pollMotor(); pollSand(); }
 }
 
 function assign(slot, cam) {
@@ -2230,6 +2231,8 @@ def build_dashboard(cameras):
         '<nav class="tabs" role="tablist">\n'
         '  <button class="tab active" id="tab-btn-live" onclick="showTab(\'live\')">'
         '&#128247; Live</button>\n'
+        '  <button class="tab" id="tab-btn-controls" onclick="showTab(\'controls\')">'
+        '&#9881; Controls</button>\n'
         '  <button class="tab" id="tab-btn-eggs" onclick="showTab(\'eggs\')">'
         '&#129370; Eggs</button>\n'
         '  <button class="tab" id="tab-btn-temps" onclick="showTab(\'temps\')">'
@@ -2241,7 +2244,9 @@ def build_dashboard(cameras):
         '  <div class="panel" id="pR"><div class="ph"><span>Outside</span>&hellip;</div></div>\n'
         '</div>\n'
         + pipe_ctrl +
-        # ── door control: single inline component ──
+        '</section>\n'
+        # ── Controls tab: door + sand dumping together ──
+        '<section class="tab-panel" id="tab-controls">\n'
         '<div class="door-panel">\n'
         '  <div class="door-head">\n'
         '    <span class="door-title">&#9881; Coop door</span>\n'
